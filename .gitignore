@@ -1,0 +1,33 @@
+# sim / build artifacts
+*.vcd
+*.fst
+*.wlf
+*.vpd
+*.ucdb
+*.wdb
+*.daidir
+*.out
+work/
+xsim.dir/
+obj_dir/
+csrc/
+simv*
+*.log
+*.jou
+*.pb
+transcript
+*.o
+*.so
+*.swp
+.DS_Store
+
+# confidential vendor models - NEVER commit contents
+tb/phy_model/*
+tb/mem_model/*
+!tb/phy_model/.gitkeep
+!tb/phy_model/README.md
+!tb/mem_model/.gitkeep
+!tb/mem_model/README.md
+
+# third-party excluded
+_thirdparty_excluded/
