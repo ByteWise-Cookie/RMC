@@ -14,6 +14,7 @@ Memory controller for DDR1-5.
 | `tb/config_tb/` | test knobs, sim config, register-init vectors |
 | `tb/tests/` | testcases |
 | `sim/` | run scripts (podman iverilog / verilator) |
+| `scripts/` | helper / automation scripts |
 | `filelists/` | `.f` compile lists |
 | `docs/` | documentation |
 
