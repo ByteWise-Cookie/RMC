@@ -1,6 +1,6 @@
 # RMC
 
-Memory controller for DDR1-5.
+Reconfigurable Memory Controller for DDR1-5.
 
 ## Layout
 
