@@ -8,7 +8,9 @@ Reconfigurable Memory Controller for DDR1-5.
 |------|----------|
 | `rtl/cif/` | CIF block |
 | `rtl/mc/` | MC core (scheduler, DFI fabric, data path) |
-| `rtl/config_rtl/` | CSR / mode registers, APB target, parametric defaults |
+| `rtl/utils/` | generic parametric blocks (FIFO, SRAM, regfile, lookahead) |
+| `rtl/csr_config/` | CSR / mode registers, APB target |
+| `rtl/rtl_pkg_config/` | compile-time packages (DDR-gen select, structural params) |
 | `tb/phy_model/` | PHY behavioral model (local, not committed) |
 | `tb/mem_model/` | DRAM memory model (local, not committed) |
 | `tb/config_tb/` | test knobs, sim config, register-init vectors |
@@ -20,7 +22,8 @@ Reconfigurable Memory Controller for DDR1-5.
 
 ## Config interface
 
-Register block accessed over APB (target in `rtl/config_rtl/`).
+Register block accessed over APB (target in `rtl/csr_config/`). Compile-time
+structure (DDR generation, counts, widths) lives in `rtl/rtl_pkg_config/`.
 
 ## Simulation
 
