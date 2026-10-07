@@ -65,6 +65,16 @@ package rmc_cfg_pkg;
   parameter int N_CH      = 2;                           // channels (1 MC core each)
   parameter int CH_W      = (N_CH > 1) ? $clog2(N_CH) : 1;
 
+  // ---- matched-bandwidth AXI width ----
+  // AXI_DW = N_DDR_CHANNELS * DDR_CHANNEL_WIDTH so the ingress (AXI write) rate
+  // equals the egress (DDR) rate -> WD/RD SRAM and ROB inflow/outflow stay balanced
+  // (inflow == outflow, no buffer blow-up).
+  // NOTE: BW = width * freq. This width-only form is exact ONLY if aclk == the DDR
+  // data rate. If aclk differs, scale: AXI_DW = N_CH*DDR_CHANNEL_W*(f_ddr/f_aclk),
+  // else AXI becomes the bottleneck and the buffers drift. (CLK_RATIO param TODO.)
+  parameter int DDR_CHANNEL_W = 2 * DQ_W;                // per-channel data width (2 subch)
+  parameter int AXI_DW        = N_CH * DDR_CHANNEL_W;    // system AXI data width
+
   // ---- packet interleave / packets-per-bank (STAGE 24) ----
   // A request fans into packets; P_MAX = packets mapped to one bank (row-hit train).
   // Spread the rest across BGs (rotate) so consecutive packets are different-BG (tCCD_S)
