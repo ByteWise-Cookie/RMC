@@ -17,8 +17,9 @@ import rmc_cfg_pkg::*;
 module rmc_cif #(
   // client AXI4
   parameter int AXI_IDW   = 8,
-  parameter int AXI_AW    = 40,
-  parameter int AXI_DW    = 512,       // 1 beat = 1 64B line (SRAM word)
+  parameter int AXI_AW    = 48,        // map needs >=41 (row ends at bit 40)
+  // AXI_DW is NOT a free param: it is rmc_cfg_pkg::AXI_DW = N_CH*DDR_CHANNEL_W
+  // (matched BW, inflow==outflow). Imported below; do not override per-instance.
   // reorder buffer / packetization
   parameter int ROB_DEPTH = 32,        // physical ROB entries (16-32)
   parameter int ROB_IDX_W = 8,         // tag width = CIF ROB_INDEX[7:0] contract
@@ -135,15 +136,21 @@ module rmc_cif #(
   // hazard cross-search + stall vectors (two ROBs, one haz router)
   logic             raw_hit, war_hit;             // read-vs-write / write-vs-read
   logic [PTR_W-1:0] raw_rd_ptr, war_wr_ptr;       // requester's own slot to hold
+  logic [PTR_W-1:0] raw_wr_ptr, war_rd_ptr;       // matched older-entry slot (release)
   logic [ROB_DEPTH-1:0] r_stall_vector, w_stall_vector;
 
   // address map: system addr -> {rank,bg,bank,row,col} (field-slice, no hash)
+  logic [CH_W-1:0]      aw_ch, ar_ch;        // channel select (route to core)
+  logic [PKT_OFF_W-1:0] aw_off, ar_off;      // byte-in-packet (write mask)
+
   rmc_cif_addrmap #(
     .AXI_AW  (AXI_AW),
     .DADDR_W (DADDR_W)
   ) u_addrmap_aw (
     .sys_addr (awaddr),
-    .daddr    (aw_daddr)
+    .daddr    (aw_daddr),
+    .ch       (aw_ch),
+    .offset   (aw_off)
   );
 
   rmc_cif_addrmap #(
@@ -151,7 +158,9 @@ module rmc_cif #(
     .DADDR_W (DADDR_W)
   ) u_addrmap_ar (
     .sys_addr (araddr),
-    .daddr    (ar_daddr)
+    .daddr    (ar_daddr),
+    .ch       (ar_ch),
+    .offset   (ar_off)
   );
 
   // segmentation: AXI burst -> <=16-beat packets, one 64B line each
@@ -192,7 +201,7 @@ module rmc_cif #(
     .srch_start     (aw_start),
     .srch_last      (aw_last),
     .srch_hit       (war_hit),
-    .srch_ptr       (/* matched read slot; release bookkeeping TODO */),
+    .srch_ptr       (war_rd_ptr),    // matched older read slot (WAR release)
     .stall_vector   (r_stall_vector)
     // TODO: alloc/retire ports
   );
@@ -219,22 +228,32 @@ module rmc_cif #(
     .srch_start     (ar_start),
     .srch_last      (ar_last),
     .srch_hit       (raw_hit),
-    .srch_ptr       (/* matched write slot; release bookkeeping TODO */),
+    .srch_ptr       (raw_wr_ptr),    // matched older write slot (RAW release)
     .stall_vector   (w_stall_vector)
     // TODO: alloc/retire ports
   );
 
-  // haz router: a hit holds the REQUESTER's own entry.
-  // TODO: raw_rd_ptr = new read's r_rob slot; war_wr_ptr = new write's w_rob slot
+  // haz router: a hit LATCHES a stall on the requester's own entry; released when
+  // the matched older entry retires. Hits are 1-cycle, so haz holds the state.
+  // TODO: raw_rd_ptr = new read's r_rob alloc slot; war_wr_ptr = new write's w_rob
+  //       alloc slot (from alloc logic). free pulses come from ROB retire (not built).
   assign raw_rd_ptr = '0;
   assign war_wr_ptr = '0;
   rmc_cif_haz #(
     .ROB_DEPTH (ROB_DEPTH)
   ) u_haz (
+    .clk            (aclk),
+    .rst_n          (aresetn),
     .raw_hit        (raw_hit),
     .raw_rd_ptr     (raw_rd_ptr),
+    .raw_wr_ptr     (raw_wr_ptr),
     .war_hit        (war_hit),
     .war_wr_ptr     (war_wr_ptr),
+    .war_rd_ptr     (war_rd_ptr),
+    .wr_free_vld    (1'b0),          // TODO: from w_rob retire
+    .wr_free_ptr    ('0),
+    .rd_free_vld    (1'b0),          // TODO: from r_rob retire
+    .rd_free_ptr    ('0),
     .r_stall_vector (r_stall_vector),
     .w_stall_vector (w_stall_vector)
   );
