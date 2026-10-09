@@ -100,7 +100,41 @@ package rmc_cfg_pkg;
   parameter int COLHI_POS = BANK_POS  + BANK_PER_BG_W;// col-high
   parameter int ROW_POS   = COLHI_POS + COL_HI_W;     // row (MSB)
 
+  // meaningful system-address bits: [0 .. MAP_ADDR_W-1] map to a DRAM coord; any
+  // address with a bit set at/above MAP_ADDR_W is out of range (reqvalidator err).
+  parameter int MAP_ADDR_W = ROW_POS + ROW_W;
+
   // ---- per-bank path sizing (STAGE 24 -> STAGE 12/15) ----
   parameter int BANK_Q_DEPTH = P_MAX;    // row-hit store / cas_fifo depth per bank
+
+  // ---- programmable address map (runtime, CSR-driven) ----
+  // The map is a per-destination-bit source select: every decoded output bit
+  // (col/row/bank/bg/rank/ch/offset) is a mux that picks one sys_addr bit. The
+  // decode is then a pure bit permutation of the input - no popcount. The CSR
+  // holds DEC_W selects; reset value = default_addr_map() = the STAGE-24 layout.
+  parameter int SYS_ADDR_W = 48;                                     // AXI byte-addr width the map indexes (== CIF AXI_AW)
+  parameter int MAP_SEL_W  = (SYS_ADDR_W > 1) ? $clog2(SYS_ADDR_W) : 1;
+  parameter int DEC_W      = DADDR_W + CH_W + PKT_OFF_W;             // total decoded (destination) bits
+
+  // Destination bit layout (LSB->MSB): offset | ch | daddr,
+  // where daddr = {rank, bg, bank, row, col} so its LSB is col[0].
+  // Returns the reset map that reproduces the fixed STAGE-24 field slicing.
+  function automatic logic [DEC_W-1:0][MAP_SEL_W-1:0] default_addr_map();
+    logic [DEC_W-1:0][MAP_SEL_W-1:0] m;
+    int d;
+    m = '0;
+    d = 0;
+    for (int j = 0; j < PKT_OFF_W;     j++) m[d++] = MAP_SEL_W'(OFF_POS   + j); // offset
+    for (int j = 0; j < CH_W;          j++) m[d++] = MAP_SEL_W'(CH_POS    + j); // ch
+    // daddr, LSB->MSB: col_lo, col_hi, row, bank, bg_lo, bg_hi, rank
+    for (int j = 0; j < COL_LO_W;      j++) m[d++] = MAP_SEL_W'(COLLO_POS + j);
+    for (int j = 0; j < COL_HI_W;      j++) m[d++] = MAP_SEL_W'(COLHI_POS + j);
+    for (int j = 0; j < ROW_W;         j++) m[d++] = MAP_SEL_W'(ROW_POS   + j);
+    for (int j = 0; j < BANK_PER_BG_W; j++) m[d++] = MAP_SEL_W'(BANK_POS  + j);
+    for (int j = 0; j < BG_LO_W;       j++) m[d++] = MAP_SEL_W'(BGLO_POS  + j);
+    for (int j = 0; j < BG_HI_W;       j++) m[d++] = MAP_SEL_W'(BGHI_POS  + j);
+    for (int j = 0; j < RANK_W;        j++) m[d++] = MAP_SEL_W'(RANK_POS  + j);
+    return m;
+  endfunction
 
 endpackage : rmc_cfg_pkg
