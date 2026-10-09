@@ -1,49 +1,45 @@
 // rmc_cif_addrmap.sv
 // System byte address -> DRAM coords {rank, bg, bank, row, col}, plus ch (channel
 // select, routes to the per-channel core) and offset (byte-in-64B-packet, for the
-// write mask / narrow-access byte lanes). Pure field-slice, no hash (stage-7 lock).
+// write mask / narrow-access byte lanes).
 //
-// Interleave (STAGE 24, P_MAX packets/bank): consecutive packets rotate BGs
-// (different-BG = tCCD_S, writes safe), then revisit the same bank's next column
-// (row-hit train of P_MAX). BG and col are SPLIT fields (low part rotates, high
-// part selects the set), assembled here. Bit positions come from rmc_cfg_pkg.
+// Runtime-programmable (CSR-driven), bit level. The map is a per-DESTINATION-bit
+// source select: each decoded output bit is a mux that picks one sys_addr bit, so
+// the decode is a pure bit permutation of the input - no popcount, no priority net.
+// (Chosen over a per-source FIELD_ID scheme: placing a bit inside its field there
+// needs a running population count per field. Per-dest muxing avoids that.)
 //
+// The live map arrives on addr_map (DEC_W selects, each MAP_SEL_W wide) from the
+// CSR; its reset value = rmc_cfg_pkg::default_addr_map(), which reproduces the
+// fixed STAGE-24 interleave:
 //   [ row | col_hi | bank | bg_hi | col_lo(P) | bg_lo | rank | ch | offset ]
 //    MSB                                                              LSB
-// daddr = {rank,bg,bank,row,col} (DRAM coords only); ch + offset are separate
-// (ch is routing, offset is a byte lane - neither is a DRAM coordinate).
+// Destination bus layout (LSB->MSB): offset | ch | daddr, with
+// daddr = {rank,bg,bank,row,col} (DRAM coords only); ch is routing, offset a byte
+// lane - neither is a DRAM coordinate.
 
-import rmc_cfg_pkg::*;
-
-module rmc_cif_addrmap #(
-  parameter int AXI_AW  = 48,        // >= 41 (STAGE-24 map: row ends at bit 40)
-  parameter int DADDR_W = 1          // = rmc_cfg_pkg::DADDR_W (passed from top)
+module rmc_cif_addrmap import rmc_cfg_pkg::*; #(
+  parameter int AXI_AW  = SYS_ADDR_W,          // sys_addr width (must match SYS_ADDR_W)
+  parameter int DADDR_W = rmc_cfg_pkg::DADDR_W  // DRAM-coord width (top may re-pass)
 )(
-  input  logic [AXI_AW-1:0]     sys_addr,
-  output logic [DADDR_W-1:0]    daddr,
-  output logic [CH_W-1:0]       ch,       // channel select (-> per-channel core)
-  output logic [PKT_OFF_W-1:0]  offset    // byte-in-64B-packet (write mask)
+  input  logic [AXI_AW-1:0]                sys_addr,
+  input  logic [DEC_W-1:0][MAP_SEL_W-1:0]  addr_map,  // per-dest source select (CSR live map)
+  output logic [DADDR_W-1:0]               daddr,
+  output logic [CH_W-1:0]                  ch,        // channel select (-> per-channel core)
+  output logic [PKT_OFF_W-1:0]             offset     // byte-in-64B-packet (write mask)
 );
 
-  logic [RANK_W-1:0]        rank;
-  logic [BG_W-1:0]          bg;      // {bg_hi, bg_lo}
-  logic [BANK_PER_BG_W-1:0] bank;
-  logic [ROW_W-1:0]         row;
-  logic [COL_W-1:0]         col;     // {col_hi, col_lo}
+  // every decoded bit = sys_addr[ its programmed source select ]
+  // selects in default_addr_map() reach at most ROW_POS+ROW_W-1 (< AXI_AW); a CSR
+  // map must keep each select < AXI_AW or it reads an out-of-range sys_addr bit.
+  logic [DEC_W-1:0] dec;
+  always_comb
+    for (int b = 0; b < DEC_W; b++)
+      dec[b] = sys_addr[ addr_map[b] ];
 
-  always_comb begin
-    offset = sys_addr[OFF_POS   +: PKT_OFF_W];
-    ch     = sys_addr[CH_POS    +: CH_W];
-    rank   = sys_addr[RANK_POS  +: RANK_W];
-    bg     = { sys_addr[BGHI_POS +: BG_HI_W],
-               sys_addr[BGLO_POS +: BG_LO_W] };
-    bank   = sys_addr[BANK_POS  +: BANK_PER_BG_W];
-    col    = { sys_addr[COLHI_POS +: COL_HI_W],
-               sys_addr[COLLO_POS +: COL_LO_W] };
-    row    = sys_addr[ROW_POS   +: ROW_W];
-  end
-
-  // pack {rank, bg, bank, row, col} (matches rmc_cfg_pkg::DADDR_W order)
-  assign daddr = { rank, bg, bank, row, col };
+  // slice the decoded bus: offset | ch | daddr   (LSB->MSB)
+  assign offset = dec[PKT_OFF_W-1:0];
+  assign ch     = dec[PKT_OFF_W            +: CH_W];
+  assign daddr  = dec[PKT_OFF_W + CH_W     +: DADDR_W];
 
 endmodule : rmc_cif_addrmap

@@ -1,13 +1,13 @@
 // rmc_cif.sv
 // Client interface (CIF) top. Sits between the client AXI4 bus and the MC core.
 // Owns: address map (system -> DRAM coords), burst segmentation (<=16-beat
-// packets), reorder buffer (program order + completion), same-line R/W hazard
-// interlock, and the client-side ports of the WD/RD data SRAMs.
+// packets), reorder buffer (program order + completion), and the client-side
+// ports of the WD/RD data SRAMs.
 //
 // Boundary to MC = two async FIFOs (external, one per direction). CIF presents a
 // synchronous valid/ready stream on its side; CDC lives in the FIFO, not here.
 //   out : request packets  {rob_index, op, daddr, pkt_num, last_in_txn, sram_slot}
-//   in  : completions      {rob_index, pkt_num, status}   (13b, tag-only)
+//   in  : completions      {rob_index}  (a pulse; ROB counts them, retires at N)
 // Read data is written by MC straight into RD_SRAM; CIF drains it to the R channel.
 //
 // STUB: top ports + sub-block instances + internal nets. Logic TODO per block.
@@ -21,15 +21,15 @@ module rmc_cif #(
   // AXI_DW is NOT a free param: it is rmc_cfg_pkg::AXI_DW = N_CH*DDR_CHANNEL_W
   // (matched BW, inflow==outflow). Imported below; do not override per-instance.
   // reorder buffer / packetization
-  parameter int ROB_DEPTH = 32,        // physical ROB entries (16-32)
-  parameter int ROB_IDX_W = 8,         // tag width = CIF ROB_INDEX[7:0] contract
-  parameter int MAX_PKTS  = 16,        // packets per request (<=16-beat segmentation)
+  parameter int ROB_DEPTH = 32,        // physical ROB entries (16-32)   [root knob]
+  parameter int MAX_PKTS  = 16,        // packets per request (<=16-beat) [root knob]
   // data buffers (client-side ports; SRAM may be instanced at MC top)
   parameter int N_WDB     = 32,        // WD_SRAM slots
   parameter int N_RDB     = 32,        // RD_SRAM slots
-  parameter int SRAM_W    = 512,       // one packet per line
 
   // derived widths (localparam: not overridable, visible to port list)
+  localparam int SRAM_W    = PKT_BYTES * 8,   // one 64B packet per line (= BL*DQ_W)
+  localparam int ROB_IDX_W = (ROB_DEPTH > 1) ? $clog2(ROB_DEPTH) : 1,  // rob_index tag
   localparam int PKT_NUM_W = (MAX_PKTS > 1) ? $clog2(MAX_PKTS) : 1,
   localparam int SLOT_W    = (($clog2(N_WDB) > $clog2(N_RDB)) ?
                               $clog2(N_WDB) : $clog2(N_RDB)),
@@ -88,12 +88,10 @@ module rmc_cif #(
   // completion stream from MC (via compl async FIFO)
   input  logic                   async_mc_cmpl_valid,
   output logic                   async_mc_cmpl_ready,
-  // SUGGEST(import): tie this ready high permanently - completion must never
-  // back-pressure (blocking a done-signal deadlocks the round trip). Only drop
-  // it on a soft reset drain. open: confirm no case needs flow control here.
-  input  logic [ROB_IDX_W-1:0]   async_mc_cmpl_rob_index,
-  input  logic [PKT_NUM_W-1:0]   async_mc_cmpl_pkt_num,
-  input  logic                   async_mc_cmpl_status,
+  // tied high permanently: a completion only bumps an already-allocated entry's
+  // counter, always absorbable in one cycle, so it must never back-pressure
+  // (blocking a done-signal deadlocks the round trip). Only drop on soft-reset drain.
+  input  logic [ROB_IDX_W-1:0]   async_mc_cmpl_rob_index,  // completion = pulse + this
 
   // WD_SRAM client-side write port (CIF writes W beats; MC reads)
   output logic                     wdb_we,
@@ -106,48 +104,24 @@ module rmc_cif #(
   input  logic [SRAM_W-1:0]        rdb_dout
 );
 
-  localparam int PG_W  = AXI_AW - 12;
-  localparam int PTR_W = (ROB_DEPTH > 1) ? $clog2(ROB_DEPTH) : 1;
-
   // nets between sub-blocks (TODO: size/name as logic fills in)
-  // daddr = DRAM coords for the req packet (hazard uses raw AXI addr, not this)
+  // daddr = DRAM coords for the req packet
   logic [DADDR_W-1:0]  aw_daddr, ar_daddr;  // TODO: into req-packet build
 
-  // AXI byte-range per request for the hazard TCAMs (exact, 4KB-rule).
-  // last = addr[11:0] + (((len+1)<<size) - 1); page = addr[AXI_AW-1:12].
-  // last byte of a burst, within its 4KB page (never overflows: AXI 4KB rule).
-  function automatic logic [11:0] axi_last(input logic [11:0] start,
-                                           input logic [7:0]  len,
-                                           input logic [2:0]  size);
-    logic [11:0] bytes;
-    bytes    = (12'(len) + 12'd1) << size;   // burst size in bytes (<=4096)
-    axi_last = start + (bytes - 12'd1);
-  endfunction
-
-  logic [PG_W-1:0] aw_page, ar_page;
-  logic [11:0]     aw_start, aw_last, ar_start, ar_last;
-  assign aw_page  = awaddr[AXI_AW-1:12];
-  assign ar_page  = araddr[AXI_AW-1:12];
-  assign aw_start = awaddr[11:0];
-  assign ar_start = araddr[11:0];
-  assign aw_last  = axi_last(aw_start, awlen, awsize);
-  assign ar_last  = axi_last(ar_start, arlen, arsize);
-
-  // hazard cross-search + stall vectors (two ROBs, one haz router)
-  logic             raw_hit, war_hit;             // read-vs-write / write-vs-read
-  logic [PTR_W-1:0] raw_rd_ptr, war_wr_ptr;       // requester's own slot to hold
-  logic [PTR_W-1:0] raw_wr_ptr, war_rd_ptr;       // matched older-entry slot (release)
-  logic [ROB_DEPTH-1:0] r_stall_vector, w_stall_vector;
-
-  // address map: system addr -> {rank,bg,bank,row,col} (field-slice, no hash)
+  // address map: system addr -> {rank,bg,bank,row,col}, runtime CSR-programmable.
+  // Live map = per-dest-bit source select; reset value = STAGE-24 default layout.
+  // TODO: drive addr_map from a CSR reg (reset to default_addr_map()); constant for now.
   logic [CH_W-1:0]      aw_ch, ar_ch;        // channel select (route to core)
   logic [PKT_OFF_W-1:0] aw_off, ar_off;      // byte-in-packet (write mask)
+  logic [DEC_W-1:0][MAP_SEL_W-1:0] addr_map;
+  assign addr_map = default_addr_map();
 
   rmc_cif_addrmap #(
     .AXI_AW  (AXI_AW),
     .DADDR_W (DADDR_W)
   ) u_addrmap_aw (
     .sys_addr (awaddr),
+    .addr_map (addr_map),
     .daddr    (aw_daddr),
     .ch       (aw_ch),
     .offset   (aw_off)
@@ -158,104 +132,63 @@ module rmc_cif #(
     .DADDR_W (DADDR_W)
   ) u_addrmap_ar (
     .sys_addr (araddr),
+    .addr_map (addr_map),
     .daddr    (ar_daddr),
     .ch       (ar_ch),
     .offset   (ar_off)
   );
 
+  // request validator: tag each AXI request address ok(1)/err(0) before the ROB.
+  // Addr-only; an err request still rides through (err bit) to retire with SLVERR.
+  // TODO: carry aw_ok/ar_ok into ROB alloc as the per-request err bit.
+  logic aw_ok, ar_ok;
+  rmc_cif_reqvalidator #(.AXI_AW(AXI_AW)) u_val_aw (
+    .req_addr (awaddr), .req_len (awlen), .req_size (awsize), .req_ok (aw_ok));
+  rmc_cif_reqvalidator #(.AXI_AW(AXI_AW)) u_val_ar (
+    .req_addr (araddr), .req_len (arlen), .req_size (arsize), .req_ok (ar_ok));
+
   // segmentation: AXI burst -> <=16-beat packets, one 64B line each
   rmc_cif_seg #(
     .AXI_AW    (AXI_AW),
-    .MAX_PKTS  (MAX_PKTS),
-    .PKT_NUM_W (PKT_NUM_W)
+    .MAX_PKTS  (MAX_PKTS)
   ) u_seg (
     .aclk    (aclk),
     .aresetn (aresetn)
     // TODO: AW/AR beat-count -> packet count; narrow/unaligned flag (stage 20)
   );
 
-  // completion never back-pressures (haz-suggest, stage 20): tie ready high.
-  // A completion only bumps a counter on an already-allocated entry, so it is
-  // always absorbable in one cycle. TODO: route cmpl to r_rob/w_rob by a
-  // direction bit in the tag; drop only on a soft-reset drain.
+  // completion never back-pressures: tie ready high. A completion only bumps a
+  // counter on an already-allocated entry, always absorbable in one cycle.
+  // TODO: route cmpl to r_rob/w_rob by a direction bit in the tag; drop only on
+  // a soft-reset drain.
   assign async_mc_cmpl_ready = 1'b1;
 
-  // read ROB. Its addr TCAM is probed by a NEW WRITE (WAR). haz holds reads.
+  // read ROB (program order + completion count). alloc/retire TODO.
   rmc_cif_rob #(
     .DIR       (0),
     .ROB_DEPTH (ROB_DEPTH),
-    .ROB_IDX_W (ROB_IDX_W),
     .MAX_PKTS  (MAX_PKTS),
-    .PKT_NUM_W (PKT_NUM_W),
     .AXI_AW    (AXI_AW)
   ) u_r_rob (
     .aclk           (aclk),
     .aresetn        (aresetn),
     .cmpl_valid     (async_mc_cmpl_valid),
-    .cmpl_rob_index (async_mc_cmpl_rob_index),
-    .cmpl_pkt_num   (async_mc_cmpl_pkt_num),
-    .cmpl_status    (async_mc_cmpl_status),
-    // probed by the new write's range (WAR)
-    .srch_valid     (awvalid),
-    .srch_page      (aw_page),
-    .srch_start     (aw_start),
-    .srch_last      (aw_last),
-    .srch_hit       (war_hit),
-    .srch_ptr       (war_rd_ptr),    // matched older read slot (WAR release)
-    .stall_vector   (r_stall_vector)
+    .cmpl_rob_index (async_mc_cmpl_rob_index)
     // TODO: alloc/retire ports
   );
 
-  // write ROB. Its addr TCAM is probed by a NEW READ (RAW); a hit stalls that
-  // new read (r_stall_vector), not the write.
+  // write ROB (program order + completion count). alloc/retire TODO.
   rmc_cif_rob #(
     .DIR       (1),
     .ROB_DEPTH (ROB_DEPTH),
-    .ROB_IDX_W (ROB_IDX_W),
     .MAX_PKTS  (MAX_PKTS),
-    .PKT_NUM_W (PKT_NUM_W),
     .AXI_AW    (AXI_AW)
   ) u_w_rob (
     .aclk           (aclk),
     .aresetn        (aresetn),
     .cmpl_valid     (async_mc_cmpl_valid),
-    .cmpl_rob_index (async_mc_cmpl_rob_index),
-    .cmpl_pkt_num   (async_mc_cmpl_pkt_num),
-    .cmpl_status    (async_mc_cmpl_status),
-    // probed by the new read's range (RAW)
-    .srch_valid     (arvalid),
-    .srch_page      (ar_page),
-    .srch_start     (ar_start),
-    .srch_last      (ar_last),
-    .srch_hit       (raw_hit),
-    .srch_ptr       (raw_wr_ptr),    // matched older write slot (RAW release)
-    .stall_vector   (w_stall_vector)
+    .cmpl_rob_index (async_mc_cmpl_rob_index)
     // TODO: alloc/retire ports
-  );
-
-  // haz router: a hit LATCHES a stall on the requester's own entry; released when
-  // the matched older entry retires. Hits are 1-cycle, so haz holds the state.
-  // TODO: raw_rd_ptr = new read's r_rob alloc slot; war_wr_ptr = new write's w_rob
-  //       alloc slot (from alloc logic). free pulses come from ROB retire (not built).
-  assign raw_rd_ptr = '0;
-  assign war_wr_ptr = '0;
-  rmc_cif_haz #(
-    .ROB_DEPTH (ROB_DEPTH)
-  ) u_haz (
-    .clk            (aclk),
-    .rst_n          (aresetn),
-    .raw_hit        (raw_hit),
-    .raw_rd_ptr     (raw_rd_ptr),
-    .raw_wr_ptr     (raw_wr_ptr),
-    .war_hit        (war_hit),
-    .war_wr_ptr     (war_wr_ptr),
-    .war_rd_ptr     (war_rd_ptr),
-    .wr_free_vld    (1'b0),          // TODO: from w_rob retire
-    .wr_free_ptr    ('0),
-    .rd_free_vld    (1'b0),          // TODO: from r_rob retire
-    .rd_free_ptr    ('0),
-    .r_stall_vector (r_stall_vector),
-    .w_stall_vector (w_stall_vector)
   );
 
   // request builder / response stubs (TODO)

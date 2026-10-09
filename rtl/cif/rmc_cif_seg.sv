@@ -10,8 +10,10 @@ import rmc_cfg_pkg::*;
 
 module rmc_cif_seg #(
   parameter int AXI_AW    = 40,
-  parameter int MAX_PKTS  = 16,
-  parameter int PKT_NUM_W = 4
+  parameter int MAX_PKTS  = 16,   // root knob
+
+  // derived (localparam: never passed in - computed from MAX_PKTS)
+  localparam int PKT_NUM_W = (MAX_PKTS > 1) ? $clog2(MAX_PKTS) : 1
 )(
   input  logic aclk,
   input  logic aresetn
