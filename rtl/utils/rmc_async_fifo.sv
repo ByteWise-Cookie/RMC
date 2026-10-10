@@ -61,7 +61,7 @@ module rmc_async_fifo #(
     return b;
   endfunction
 
-  // ================= write domain =================
+  //write domain
   // increment uses the REGISTERED wfull (no comb loop through wfull_val)
   assign winc      = wr_en & ~wfull;
   assign wbin_nxt  = wbin + PW'(winc);
@@ -98,7 +98,7 @@ module rmc_async_fifo #(
     else         wfull <= wfull_val;
   end
 
-  // ================= read domain =================
+  //read domain
   assign rinc      = rd_en & ~rempty;
   assign rbin_nxt  = rbin + PW'(rinc);
   assign rgray_nxt = rbin_nxt ^ (rbin_nxt >> 1);
@@ -133,7 +133,7 @@ module rmc_async_fifo #(
   assign rd_data  = mem[rbin[AW-1:0]];   // FWFT
   assign rd_valid = ~rempty;
 
-  // ================= optional almost flags (conservative) =================
+  // optional almost flags (conservative)
   // write side sees a lagging read ptr -> underestimates free -> early almost_full
   // read side sees a lagging write ptr -> underestimates fill -> early almost_empty
   generate
