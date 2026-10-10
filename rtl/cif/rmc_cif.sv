@@ -163,32 +163,51 @@ module rmc_cif #(
   // a soft-reset drain.
   assign async_mc_cmpl_ready = 1'b1;
 
-  // read ROB (program order + completion count). alloc/retire TODO.
+  // PLAN (not built here yet): a pre-ROB AW_req buffer sits post request_validator
+  // and before the ROB, one per direction. It holds the phys addr (which the ROB
+  // does NOT store) and feeds the burst splitter directly, and it decouples up to
+  // N_OUTSTANDING requests. The ROB only ADMITS: it takes {id,len,size,validated}
+  // on AW_REQUEST/A_ID_VALID and backpressures via A_ID_READY. The buffer is not
+  // built yet - for now admit is wired straight from the validator + AXI channel.
+
+  // read ROB (admit + program order + completion count). alloc/retire TODO.
   rmc_cif_rob #(
     .DIR       (0),
     .ROB_DEPTH (ROB_DEPTH),
     .MAX_PKTS  (MAX_PKTS),
+    .AXI_IDW   (AXI_IDW),
     .AXI_AW    (AXI_AW)
   ) u_r_rob (
     .aclk           (aclk),
     .aresetn        (aresetn),
     .cmpl_valid     (async_mc_cmpl_valid),
-    .cmpl_rob_index (async_mc_cmpl_rob_index)
-    // TODO: alloc/retire ports
+    .cmpl_rob_index (async_mc_cmpl_rob_index),
+    // admit: direct from the AR channel + validator (AR_req buffer not built yet).
+    // AW_REQUEST = {id, len, size, validated}; ready backpressures the AR channel.
+    .AW_REQUEST     ({arid, arlen, arsize, ar_ok}),
+    .A_ID_VALID     (arvalid),
+    .A_ID_READY     (arready)
+    // TODO: retire -> R response + slot free
   );
 
-  // write ROB (program order + completion count). alloc/retire TODO.
+  // write ROB (admit + program order + completion count). alloc/retire TODO.
   rmc_cif_rob #(
     .DIR       (1),
     .ROB_DEPTH (ROB_DEPTH),
     .MAX_PKTS  (MAX_PKTS),
+    .AXI_IDW   (AXI_IDW),
     .AXI_AW    (AXI_AW)
   ) u_w_rob (
     .aclk           (aclk),
     .aresetn        (aresetn),
     .cmpl_valid     (async_mc_cmpl_valid),
-    .cmpl_rob_index (async_mc_cmpl_rob_index)
-    // TODO: alloc/retire ports
+    .cmpl_rob_index (async_mc_cmpl_rob_index),
+    // admit: direct from the AW channel + validator (AW_req buffer not built yet).
+    // AW_REQUEST = {id, len, size, validated}; ready backpressures the AW channel.
+    .AW_REQUEST     ({awid, awlen, awsize, aw_ok}),
+    .A_ID_VALID     (awvalid),
+    .A_ID_READY     (awready)
+    // TODO: retire -> B response + slot free
   );
 
   // request builder / response stubs (TODO)
@@ -200,12 +219,11 @@ module rmc_cif #(
   assign async_mc_req_last_in_txn = 1'b0;
   assign async_mc_req_sram_slot   = '0;
 
-  assign awready = 1'b0;
+  // awready / arready are driven by the ROBs' A_ID_READY (admit backpressure).
   assign wready  = 1'b0;
   assign bid     = '0;
   assign bresp   = 2'b00;
   assign bvalid  = 1'b0;
-  assign arready = 1'b0;        // TODO: gate with ROB stall_vector for this AR
   assign rid     = '0;
   assign rdata   = '0;
   assign rresp   = 2'b00;
