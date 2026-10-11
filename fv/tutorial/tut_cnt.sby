@@ -1,0 +1,35 @@
+# Tutorial run. From fv/:  make tut [T=<task>]
+#   bmc         bounded check, 20 cycles from reset
+#   cover       trace for every cover
+#   prove_weak  induction without the helper invariant (expected: UNKNOWN)
+#   prove       induction with the helper invariant   (expected: PASS)
+
+[tasks]
+bmc
+cover
+prove_weak
+prove
+
+[options]
+bmc:        mode bmc
+bmc:        depth 20
+cover:      mode cover
+cover:      depth 20
+prove_weak: mode prove
+prove_weak: depth 8
+prove:      mode prove
+prove:      depth 8
+
+[engines]
+smtbmc bitwuzla
+
+[script]
+plugin -i slang
+prove:  read_slang --top tut_cnt -D FV_HELPER tut_cnt.sv tut_cnt_fv.sv
+~prove: read_slang --top tut_cnt tut_cnt.sv tut_cnt_fv.sv
+prep -top tut_cnt
+async2sync
+
+[files]
+tutorial/tut_cnt.sv
+tutorial/tut_cnt_fv.sv

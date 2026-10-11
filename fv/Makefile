@@ -17,11 +17,13 @@ WORK := work
 # short name -> .sby file
 SBY_rob := cif/rmc_cif_rob/rmc_cif_rob.sby
 SBY_robtest := cif/rmc_cif_rob/rob_test.sby
+SBY_tut := tutorial/tut_cnt.sby
 
-MODULES := rob robtest
+MODULES := rob robtest tut
 
 .PHONY: all $(MODULES) traces wave clean
-all: $(MODULES)
+# tut is a teaching example with an expected failure; run it by name
+all: $(filter-out tut,$(MODULES))
 
 $(MODULES):
 	@mkdir -p $(WORK)
