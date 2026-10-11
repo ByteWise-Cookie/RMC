@@ -1,0 +1,99 @@
+rmc_cif_rob properties          code: rmc_cif_rob_fv.sv
+
+  ->   implies, same cycle          =>   implies, next cycle
+  [i]  per slot                     live[i] = slot i admitted, not retired
+  admit  = A_ID_VALID & A_ID_READY  sealed[i] = slot i got SEG_LAST
+  retire = RESP_VALID & RESP_READY  head = retire_ptr, tail = alloc_ptr
+  cmpl[i] = completions seen        exp_* = value captured at admit
+
+
+ASSUME
+  m_reset_first   cycle 0: aresetn == 0
+  m_seg_last      SEG_LAST -> pending_split
+                  SEG_LAST -> 1 <= SEG_NPKTS <= MAX_PKTS
+                  SEG_LAST -> SEG_NPKTS >= cmpl[tail]
+  m_cmpl          cmpl_valid -> live[cmpl_rob_index]
+                  cmpl_valid -> cmpl[idx] < (sealed[idx] ? n_pkts[idx] : MAX_PKTS)
+
+  d4_live task only (fairness):
+  m_ready_fair    RESP_READY low for at most 4 cycles in a row
+  m_seg_fair      pending_split -> SEG_LAST within 3 cycles
+  m_cmpl_fair     head sealed & outflow_cnt[head] != n_pkts[head]
+                  -> completion for head within 3 cycles
+
+  free: A_ID_VALID AW_REQUEST A_META RESP_READY cmpl_err, reset mid-run
+
+
+ASSERT  interface
+  a_ready         A_ID_READY == !rob_full & !pending_split
+  a_no_reuse      admit -> !live[ROB_IDX]
+  a_idx_valid     ROB_IDX_VALID == pending_split
+  a_idx           ROB_IDX == tail
+  a_idx_hold      ROB_IDX_VALID & !SEG_LAST => ROB_IDX_VALID & stable(ROB_IDX)
+  a_admit_split   admit => ROB_IDX_VALID
+  a_resp_valid    RESP_VALID == live[head] & sealed[head] & (cmpl[head] == n_pkts[head])
+  a_resp_id       RESP_VALID -> RESP_ID == exp_id[head]
+  a_resp_resp     RESP_VALID -> RESP_RESP == (exp_slverr[head] ? 2'b10 : 2'b00)
+  a_resp_hold     RESP_VALID & !RESP_READY => RESP_VALID & stable(RESP_ID, RESP_RESP)
+  a_resp_meta     NEED_META=1: RESP_VALID -> {RESP_LEN,RESP_SIZE,RESP_OFFSET,RESP_HEAD_PTR} == exp_meta[head]
+                  NEED_META=0: {RESP_LEN,RESP_SIZE,RESP_OFFSET,RESP_HEAD_PTR} == 0
+  a_reset         first cycle after reset: occ == 0, alloc_ptr == 0, retire_ptr == 0,
+                  !pending_split, A_ID_READY, !ROB_IDX_VALID, !RESP_VALID
+  a_full_bp       occ == ROB_DEPTH -> !A_ID_READY
+  a_refuse        A_ID_VALID & !A_ID_READY & !retire & !SEG_LAST => stable(occ, alloc_ptr)
+
+ASSERT  liveness, bounded   (d4_live task only)
+  a_head_live     live[head] -> RESP_VALID within 4 + 4*MAX_PKTS cycles      (spec 14)
+  a_resp_live     RESP_VALID -> retire within 4 cycles                       (spec 15)
+  helpers:
+  a_fair_range    seg_wait <= 3, cmpl_wait <= 3
+  a_age_split     live[head] & !sealed[head] -> head_age <= seg_wait
+  a_age_cmpl      live[head] &  sealed[head] -> head_age <= 4 + 4*outflow_cnt[head] + cmpl_wait
+  a_wait_helper   resp wait <= RESP_READY low streak <= 4
+
+ASSERT  ring
+  a_ptr_range     alloc_ptr < ROB_DEPTH, retire_ptr < ROB_DEPTH
+  a_occ_max       occ <= ROB_DEPTH
+  a_occ           occ == countones(live)
+  a_ring          alloc_ptr == (retire_ptr + occ - pending_split) mod ROB_DEPTH
+  a_alloc_move    !SEG_LAST => stable(alloc_ptr)
+  a_ret_move      !retire   => stable(retire_ptr)
+  a_tail a_head a_split     DUT ptr / pending_split == checker copy
+
+ASSERT  per slot [i]
+  a_live          live[i] == ((i - retire_ptr) mod ROB_DEPTH < occ)
+  a_unsealed      live[i] & !sealed[i] == pending_split & (alloc_ptr == i)
+  a_id            live[i] -> ent_id[i] == exp_id[i]
+  a_err           live[i] -> (ent_err[i] | ent_derr[i]) == exp_slverr[i]
+  a_inflow        live[i] -> inflow_complt[i] == sealed[i]
+  a_cnt           live[i] -> outflow_cnt[i] == cmpl[i]
+  a_npkts         live[i] & sealed[i] -> 1 <= n_pkts[i] <= MAX_PKTS
+  a_bound         live[i] -> outflow_cnt[i] <= (sealed[i] ? n_pkts[i] : MAX_PKTS)
+  a_meta          NEED_META=1: live[i] -> mem_meta[i] == exp_meta[i]
+
+
+COVER
+  c_retire        retire
+  c_full          occ == ROB_DEPTH
+  c_full_retire   occ == ROB_DEPTH & retire
+  c_slverr        retire & RESP_RESP == 2'b10
+  c_okay_max      retire & RESP_RESP == 2'b00 & n_pkts[head] == MAX_PKTS
+  c_wrap          retire & retire_ptr == ROB_DEPTH-1
+  c_early_cmpl    SEG_LAST & cmpl[tail] != 0
+  c_reset_midrun  reset while requests in flight, then a new request retires
+  c_fill_bp_drain admit ids 0,1,2.. until full, refused on full, drain to empty
+  d4_livecov task only:
+  c_wait_max      a response waits the full 4 cycles
+  c_head_age_max  head waits the full 4 + 4*MAX_PKTS cycles for RESP_VALID
+  rob_test:
+  c_both_retire   r_retire & w_retire
+  c_r_full_w_idle r_rob full & w_rob idle
+
+
+NOT DONE
+  true liveness   "eventually" with no cycle bound (frontend has no s_eventually)
+  per-request     wait bound for a request that is not the oldest
+
+
+ADD YOURS   (same style or plain words, one per line)
+  

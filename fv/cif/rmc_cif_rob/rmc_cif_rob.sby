@@ -1,0 +1,50 @@
+# rmc_cif_rob formal run. Run from fv/ (paths are relative to it):  make rob [T=<task>]
+#
+# task = <config>_<mode>
+#   config  d4     ROB_DEPTH=4 MAX_PKTS=4 AXI_IDW=4   small, power-of-2 ring
+#           d3     ROB_DEPTH=3 MAX_PKTS=2 AXI_IDW=2   non power-of-2 wrap
+#           nometa d4 with NEED_META=0
+#           full   RTL defaults (32 / 16 / 8)
+#   mode    prove  unbounded proof of every assert (k-induction)
+#           cover  a trace for every cover
+#           bmc    bounded check from reset
+#           live   prove + cover with the RESP_READY fairness assumption (spec 15)
+
+[tasks]
+d4_prove     d4 prove
+d4_cover     d4 cover
+d4_bmc       d4 bmc
+d4_live      d4l prove
+d4_livecov   d4l cover
+d3_prove     d3 prove
+d3_cover     d3 cover
+nometa_prove nometa prove
+full_prove   full prove
+
+[options]
+prove: mode prove
+prove: depth 3
+cover: mode cover
+cover: depth 40
+bmc:   mode bmc
+bmc:   depth 30
+
+[engines]
+smtbmc bitwuzla
+
+[script]
+plugin -i slang
+nometa: read_slang --top rmc_cif_rob --no-implicit-memories -D FORMAL -G ROB_DEPTH=4 -G MAX_PKTS=4 -G AXI_IDW=4 -G NEED_META=0 rmc_cfg_pkg.sv rmc_cif_rob.sv rmc_cif_rob_fv.sv rmc_cif_rob_bind.sv
+d4l:    read_slang --top rmc_cif_rob --no-implicit-memories -D FORMAL -D FV_LIVE -G ROB_DEPTH=4 -G MAX_PKTS=4 -G AXI_IDW=4 rmc_cfg_pkg.sv rmc_cif_rob.sv rmc_cif_rob_fv.sv rmc_cif_rob_bind.sv
+d4:     read_slang --top rmc_cif_rob --no-implicit-memories -D FORMAL -G ROB_DEPTH=4 -G MAX_PKTS=4 -G AXI_IDW=4 rmc_cfg_pkg.sv rmc_cif_rob.sv rmc_cif_rob_fv.sv rmc_cif_rob_bind.sv
+d3:     read_slang --top rmc_cif_rob --no-implicit-memories -D FORMAL -G ROB_DEPTH=3 -G MAX_PKTS=2 -G AXI_IDW=2 rmc_cfg_pkg.sv rmc_cif_rob.sv rmc_cif_rob_fv.sv rmc_cif_rob_bind.sv
+full:   read_slang --top rmc_cif_rob --no-implicit-memories -D FORMAL rmc_cfg_pkg.sv rmc_cif_rob.sv rmc_cif_rob_fv.sv rmc_cif_rob_bind.sv
+prep -top rmc_cif_rob
+# async-reset flops -> sync model (single clock, reset sampled on aclk)
+async2sync
+
+[files]
+../rtl/rtl_pkg_config/rmc_cfg_pkg.sv
+../rtl/cif/rmc_cif_rob.sv
+cif/rmc_cif_rob/rmc_cif_rob_fv.sv
+cif/rmc_cif_rob/rmc_cif_rob_bind.sv
