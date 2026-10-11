@@ -196,7 +196,8 @@ module rmc_cif #(
     .ROB_DEPTH (ROB_DEPTH),
     .MAX_PKTS  (MAX_PKTS),
     .AXI_IDW   (AXI_IDW),
-    .AXI_AW    (AXI_AW)
+    .AXI_AW    (AXI_AW),
+    .NEED_META (1'b0)        // B response is id + resp only: no per-slot metadata
   ) u_w_rob (
     .aclk           (aclk),
     .aresetn        (aresetn),
