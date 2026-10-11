@@ -3,7 +3,8 @@
 //
 // Role:
 //   - admit a validated request and allocate its rob_index (a ring slot)
-//   - hand the slot to the segmenter (burst splitter), track when inflow is done //PREHANDED.. the REQUIER VALIDOARED ogive a meta data bvlaid the phy address
+//   - hand the slot to the segmenter (burst splitter), track when inflow is done
+//     (the request_validator / AW_req buffer pre-hands the metadata + phys addr)
 //   - count MC completions (outflow) and retire in program order to drive B / R
 //
 // Slot ring (no shift register, no per-slot valid bit):
@@ -36,9 +37,10 @@ module rmc_cif_rob #(
   localparam int ROB_IDX_W  = (ROB_DEPTH > 1) ? $clog2(ROB_DEPTH)  : 1, // rob_index tag width
   localparam int PTR_W      = (ROB_DEPTH > 1) ? $clog2(ROB_DEPTH)  : 1, // ring pointer width
   localparam int CNT_W      = (MAX_PKTS  > 1) ? $clog2(MAX_PKTS+1) : 1, // packet counter width
-  localparam int REQ_META_W = AXI_IDW + 8 + 3 + 1, // admit payload {id,len8,size3,validated1}
-  localparam int SLOT_PTR_W = 16,                  // TODO: = $clog2(data-SRAM depth)
-  localparam int META_W     = 8 + 3 + SLOT_PTR_W   // mem_meta: {len8, size3, head_mem_ptr}
+  localparam int REQ_META_W = AXI_IDW + 8 + 3 + 1,            // admit payload {id,len8,size3,validated1}
+  localparam int SLOT_PTR_W = 16,                             // TODO: = $clog2(data-SRAM depth)
+  localparam int AMETA_W    = PKT_OFF_W + SLOT_PTR_W,         // admit extras {start_offset, head_mem_ptr}
+  localparam int META_W     = 8 + 3 + PKT_OFF_W + SLOT_PTR_W  // mem_meta: {len8,size3,offset,head_ptr}
 )(
   input  logic                   aclk,
   input  logic                   aresetn,
@@ -51,6 +53,7 @@ module rmc_cif_rob #(
 
   // admit (from the pre-ROB AW_req buffer, post request_validator)
   input  logic [REQ_META_W-1:0]  AW_REQUEST,       // {A_ID, A_LEN, A_SIZE, A_VALIDATED}
+  input  logic [AMETA_W-1:0]     A_META,           // extra read-meta: {start_offset, head_mem_ptr}
   input  logic                   A_ID_VALID,       // a request is offered
   output logic                   A_ID_READY,       // ROB can admit (slot free, none mid-split)
 
@@ -69,6 +72,7 @@ module rmc_cif_rob #(
   output logic [AXI_IDW-1:0]     RESP_ID,          // AXI id for the response
   output logic [1:0]             RESP_RESP,        // AXI resp: 00 OKAY / 10 SLVERR
   output logic [SLOT_PTR_W-1:0]  RESP_HEAD_PTR,    // read only: RD_SRAM head slot
+  output logic [PKT_OFF_W-1:0]   RESP_OFFSET,      // read only: start byte offset (pre/post trim)
   output logic [7:0]             RESP_LEN,         // read only: ar_len
   output logic [2:0]             RESP_SIZE         // read only: ar_size
 );
@@ -91,22 +95,15 @@ module rmc_cif_rob #(
   logic [CNT_W-1:0]   n_pkts        [ROB_DEPTH]; // packet count, latched on SEG_LAST
   logic [CNT_W-1:0]   outflow_cnt   [ROB_DEPTH]; // completions seen, ++ per pulse
 
-  // optional per-slot metadata RAM ("mem_")
-  // read side stashes {len, size, head_mem_ptr} to rebuild RD_SRAM offsets on the
-  // resp path; write side stashes the slot chain. NEED_META=0 drops it entirely.
-  // layout (MSB->LSB): {len[8], size[3], head_mem_ptr[SLOT_PTR_W]}.
-  generate
-    if (NEED_META) begin : g_meta
-      logic [META_W-1:0] mem_meta [ROB_DEPTH];    // write@admit/seg, read@resp/retire
-      // TODO: mem_meta[alloc_ptr] <= {len, size, head_mem_ptr}; read on resp path
-    end
-  endgenerate
-
-  // admit payload field-slice
+  // admit payload field-slice: {A_ID, A_LEN[8], A_SIZE[3], A_VALIDATED[1]}, MSB->LSB
   logic [AXI_IDW-1:0] admit_id;
+  logic [7:0]         admit_len;
+  logic [2:0]         admit_size;
   logic               admit_ok;   // A_VALIDATED: 1 = address validated OK
-  assign admit_id = AW_REQUEST[REQ_META_W-1 -: AXI_IDW]; // top bits = A_ID
-  assign admit_ok = AW_REQUEST[0];                       // LSB      = A_VALIDATED
+  assign admit_id   = AW_REQUEST[REQ_META_W-1 -: AXI_IDW];
+  assign admit_len  = AW_REQUEST[4 +: 8];
+  assign admit_size = AW_REQUEST[1 +: 3];
+  assign admit_ok   = AW_REQUEST[0];
 
   // handoff (registered, no comb path off admit_fire)
   // ROB_IDX is just alloc_ptr (a flop). pending_split marks the slot as handed to
@@ -118,11 +115,8 @@ module rmc_cif_rob #(
   assign ROB_IDX_VALID = pending_split;              // registered handoff valid
 
   // retire / response (comb)
-  // done = inflow latched AND every packet completed (outflow == n_pkts). We ALWAYS
-  // wait for the full outflow, even on an error: MC completes every packet (it may
-  // still have packets in its pipeline), so retiring early would free the slot
-  // before they drain and a late completion would corrupt the reused slot. The
-  // error does not change WHEN we retire - only the resp code (SLVERR) via ent_*.
+  // done = inflow latched AND every packet completed. outflow is an UP-counter vs
+  // n_pkts (a down-counter to 0 would miss completions that arrive before SEG_LAST).
   assign RESP_VALID = ~rob_empty
                     & inflow_complt[retire_ptr]
                     & (outflow_cnt[retire_ptr] == n_pkts[retire_ptr]);
@@ -130,16 +124,24 @@ module rmc_cif_rob #(
   assign RESP_RESP  = (ent_err[retire_ptr] | ent_derr[retire_ptr]) ? 2'b10 : 2'b00; // SLVERR / OKAY
   wire retire_fire  = RESP_VALID & RESP_READY;
 
-  // read-side extras (DIR=0): rebuild the R beats from the metadata RAM. For a
-  // write ROB these tie to 0 (the B path uses only id + resp).
+  // per-slot metadata RAM ("mem_"): write at admit, read the oldest out on the resp
+  // extras (valid with RESP_VALID, alongside RESP_ID). NEED_META=0 ties them to 0.
+  // layout (MSB->LSB): {len[8], size[3], start_offset[PKT_OFF_W], head_mem_ptr[SLOT_PTR_W]}.
   generate
-    if (NEED_META) begin : g_resp
-      assign RESP_LEN      = g_meta.mem_meta[retire_ptr][META_W-1 -: 8];
-      assign RESP_SIZE     = g_meta.mem_meta[retire_ptr][SLOT_PTR_W +: 3];
-      assign RESP_HEAD_PTR = g_meta.mem_meta[retire_ptr][SLOT_PTR_W-1:0];
-    end else begin : g_resp
+    if (NEED_META) begin : g_meta
+      logic [META_W-1:0] mem_meta [ROB_DEPTH];
+      // write: len/size from AW_REQUEST, {start_offset, head_mem_ptr} from A_META
+      always_ff @(posedge aclk)
+        if (admit_fire) mem_meta[alloc_ptr] <= {admit_len, admit_size, A_META};
+      // read: the oldest entry (retire_ptr), consumed when RESP_VALID & RESP_READY
+      assign RESP_LEN      = mem_meta[retire_ptr][META_W-1 -: 8];
+      assign RESP_SIZE     = mem_meta[retire_ptr][SLOT_PTR_W+PKT_OFF_W +: 3];
+      assign RESP_OFFSET   = mem_meta[retire_ptr][SLOT_PTR_W +: PKT_OFF_W];
+      assign RESP_HEAD_PTR = mem_meta[retire_ptr][SLOT_PTR_W-1:0];
+    end else begin : g_meta
       assign RESP_LEN      = '0;
       assign RESP_SIZE     = '0;
+      assign RESP_OFFSET   = '0;
       assign RESP_HEAD_PTR = '0;
     end
   endgenerate
@@ -160,6 +162,7 @@ module rmc_cif_rob #(
         inflow_complt[alloc_ptr] <= 1'b0;
         outflow_cnt[alloc_ptr]   <= '0;
         pending_split            <= 1'b1;
+        // mem_meta write is in the g_meta block (same admit_fire condition)
       end
       // SEG_LAST: inflow done + packet count, clear pending, advance alloc_ptr
       if (SEG_LAST) begin
@@ -176,8 +179,7 @@ module rmc_cif_rob #(
       // retire: pop the oldest slot
       if (retire_fire)
         retire_ptr <= (retire_ptr == PTR_W'(ROB_DEPTH-1)) ? '0 : retire_ptr + 1'b1;
-      // occupancy: admit adds, retire removes
-      // on retire fire give out the meta and mem head prt and axi_len seize form mem prt// we forgot that
+      // occupancy: admit adds, retire removes (mem_meta is read out on RESP_* above)
       occ <= occ + OCC_W'(admit_fire) - OCC_W'(retire_fire);
     end
   end
