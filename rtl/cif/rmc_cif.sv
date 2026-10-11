@@ -147,14 +147,17 @@ module rmc_cif #(
   rmc_cif_reqvalidator #(.AXI_AW(AXI_AW)) u_val_ar (
     .req_addr (araddr), .req_len (arlen), .req_size (arsize), .req_ok (ar_ok));
 
-  // segmentation: AXI burst -> <=16-beat packets, one 64B line each
-  rmc_cif_seg #(
-    .AXI_AW    (AXI_AW),
-    .MAX_PKTS  (MAX_PKTS)
-  ) u_seg (
-    .aclk    (aclk),
-    .aresetn (aresetn)
-    // TODO: AW/AR beat-count -> packet count; narrow/unaligned flag (stage 20)
+  // segmentation: read + write burst splitters, one per direction. Stubs - wiring
+  // TODO (ROB handoff, pre-ROB buffer, addr_map, per-channel req FIFOs).
+  rmc_cif_rseg #(
+    .ROB_DEPTH (ROB_DEPTH), .MAX_PKTS (MAX_PKTS), .AXI_AW (AXI_AW)
+  ) u_rseg (
+    .aclk (aclk), .aresetn (aresetn)
+  );
+  rmc_cif_wseg #(
+    .ROB_DEPTH (ROB_DEPTH), .MAX_PKTS (MAX_PKTS), .AXI_AW (AXI_AW)
+  ) u_wseg (
+    .aclk (aclk), .aresetn (aresetn)
   );
 
   // completion never back-pressures: tie ready high. A completion only bumps a
@@ -170,45 +173,36 @@ module rmc_cif #(
   // on AW_REQUEST/A_ID_VALID and backpressures via A_ID_READY. The buffer is not
   // built yet - for now admit is wired straight from the validator + AXI channel.
 
-  // read ROB (admit + program order + completion count). alloc/retire TODO.
-  rmc_cif_rob #(
-    .DIR       (0),
+  // read ROB. admit direct from AR channel + validator (AR_req buffer not built yet).
+  rmc_cif_rrob #(
     .ROB_DEPTH (ROB_DEPTH),
     .MAX_PKTS  (MAX_PKTS),
-    .AXI_IDW   (AXI_IDW),
-    .AXI_AW    (AXI_AW)
-  ) u_r_rob (
+    .AXI_IDW   (AXI_IDW)
+  ) u_rrob (
     .aclk           (aclk),
     .aresetn        (aresetn),
     .cmpl_valid     (async_mc_cmpl_valid),
     .cmpl_rob_index (async_mc_cmpl_rob_index),
-    // admit: direct from the AR channel + validator (AR_req buffer not built yet).
-    // AW_REQUEST = {id, len, size, validated}; ready backpressures the AR channel.
     .AW_REQUEST     ({arid, arlen, arsize, ar_ok}),
     .A_ID_VALID     (arvalid),
     .A_ID_READY     (arready)
-    // TODO: retire -> R response + slot free
+    // TODO: SEG_* from u_rseg; RESP_* -> R response path
   );
 
-  // write ROB (admit + program order + completion count). alloc/retire TODO.
-  rmc_cif_rob #(
-    .DIR       (1),
+  // write ROB. admit direct from AW channel + validator (AW_req buffer not built yet).
+  rmc_cif_wrob #(
     .ROB_DEPTH (ROB_DEPTH),
     .MAX_PKTS  (MAX_PKTS),
-    .AXI_IDW   (AXI_IDW),
-    .AXI_AW    (AXI_AW),
-    .NEED_META (1'b0)        // B response is id + resp only: no per-slot metadata
-  ) u_w_rob (
+    .AXI_IDW   (AXI_IDW)
+  ) u_wrob (
     .aclk           (aclk),
     .aresetn        (aresetn),
     .cmpl_valid     (async_mc_cmpl_valid),
     .cmpl_rob_index (async_mc_cmpl_rob_index),
-    // admit: direct from the AW channel + validator (AW_req buffer not built yet).
-    // AW_REQUEST = {id, len, size, validated}; ready backpressures the AW channel.
     .AW_REQUEST     ({awid, awlen, awsize, aw_ok}),
     .A_ID_VALID     (awvalid),
     .A_ID_READY     (awready)
-    // TODO: retire -> B response + slot free
+    // TODO: SEG_* from u_wseg; RESP_* -> B response path
   );
 
   // request builder / response stubs (TODO)
