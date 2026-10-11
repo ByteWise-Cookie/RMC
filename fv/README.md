@@ -10,6 +10,7 @@ fv/
     rmc_cif_rob_bind.sv   binds the checker into the DUT (RTL stays untouched)
     rmc_cif_rob.sby       tasks: which config, which mode, which solver
     rmc_cif_rob_props.txt every assume / assert / cover, one line each; add yours at the bottom
+    rob_test.sby          read + write ROB pair (tb/tests/module_level/rob)
   work/                   run output (ignored by git)
 ```
 
