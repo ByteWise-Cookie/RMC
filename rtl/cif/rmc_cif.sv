@@ -32,6 +32,7 @@ module rmc_cif #(
   localparam int ROB_IDX_W = (ROB_DEPTH > 1) ? $clog2(ROB_DEPTH) : 1,  // rob_index tag
   localparam int PKT_NUM_W = (MAX_PKTS > 1) ? $clog2(MAX_PKTS) : 1,
   localparam int CNT_W     = (MAX_PKTS > 1) ? $clog2(MAX_PKTS+1) : 1,  // packet-count width
+  localparam int SPAN_W    = $clog2(MAX_REQ_BYTES + 1),                // bytes-spanned width
   localparam int SLOT_W    = (($clog2(N_WDB) > $clog2(N_RDB)) ?
                               $clog2(N_WDB) : $clog2(N_RDB)),
   localparam int DADDR_W   = RANK_W + BG_W + BANK_PER_BG_W + ROW_W + COL_W
@@ -180,6 +181,13 @@ module rmc_cif #(
   // same cycle, so gate each on the other's readiness.
   assign ar_admit = arvalid & ar_rseg_ready & ar_rrob_rdy;
 
+  // admit-time packet count for the ROB (known now; ships early so completions that beat
+  // the split still count). Same geometry rseg uses: size-aligned start + burst, ceil/64.
+  wire [PKT_OFF_W-1:0] ar_off_aligned = araddr[PKT_OFF_W-1:0]
+                                      & ~PKT_OFF_W'((SPAN_W'(1) << arsize) - 1'b1);
+  wire [SPAN_W-1:0]    ar_span   = SPAN_W'(ar_off_aligned) + ((SPAN_W'(arlen) + 1'b1) << arsize);
+  wire [CNT_W-1:0]     ar_npkts  = CNT_W'((ar_span + SPAN_W'((1 << PKT_OFF_W) - 1)) >> PKT_OFF_W);
+
   // read segmenter. TODO: req_dbuf_base from the RD-SRAM slot allocator (not built) and
   // pkt_* -> the per-channel req async FIFOs (single async_mc_req_* port today; needs an
   // N_CH->1 arbiter or a per-channel FIFO interface).
@@ -198,6 +206,7 @@ module rmc_cif #(
     .ready        (ar_rseg_ready),
     .pkt_valid    (/* TODO: per-channel req FIFO */),
     .pkt_ready    (/* TODO */),
+    .pkt_dbuf_adr_ready ({N_CH{1'b1}}),  // TODO: from RD-SRAM allocator (slot availability)
     .pkt_rob_idx  (/* TODO */),
     .pkt_daddr    (/* TODO */),
     .pkt_dbuf_adr (/* TODO */),
@@ -245,13 +254,13 @@ module rmc_cif #(
     .aresetn        (aresetn),
     .cmpl_valid     (async_mc_cmpl_valid),
     .cmpl_rob_index (async_mc_cmpl_rob_index),
-    .AW_REQUEST     ({arid, arlen, arsize, ar_ok}),
+    .AW_REQUEST     ({arid, ar_ok}),
+    .ADMIT_NPKTS    (ar_npkts),
     .A_ID_VALID     (arvalid & ar_rseg_ready),
     .A_ID_READY     (ar_rrob_rdy),
     .ROB_IDX        (ar_rob_idx),
     .SEG_LAST       (ar_seg_last),
     .SEG_ROB_IDX    (ar_seg_rob_idx),
-    .SEG_NPKTS      (ar_seg_npkts),
     .SEG_OFFSET     (ar_seg_offset),
     .SEG_LEN        (ar_seg_len),
     .SEG_SIZE       (ar_seg_size),
