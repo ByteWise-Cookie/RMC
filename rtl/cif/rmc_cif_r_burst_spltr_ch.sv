@@ -12,7 +12,9 @@
 //   base_ch = aligned_base[CH_W-1:0]
 //   k0      = (ch_id - base_ch) mod N_CH           first packet index of this channel
 //   k       = k0 + m*N_CH                           m = packets of this channel issued so far
-//   line addr = (aligned_base + k) << 6 ; addrmap(line) -> daddr. dbuf = dbuf_base + k.
+//   line addr = (aligned_base + k) << 6 ; addrmap(line) -> daddr.
+//   dbuf slot  = e_dbuf_base + m  (PER-CHANNEL packed: this channel's own base + its own
+//                packet count m, dense in its own RD-SRAM - not the global line index k).
 // Assumes the ch field is the low contiguous line field (contract/default map).
 
 import rmc_cfg_pkg::*;
@@ -43,7 +45,7 @@ module rmc_cif_r_burst_spltr_ch #(
   input  logic                   entry_valid,     // rd_ptr != alloc_ptr (entry occupied)
   input  logic [LINE_W-1:0]      e_aligned_base,  // entry's 64B base line
   input  logic [CNT_W-1:0]       e_n_pkts,        // entry's total packet count
-  input  logic [SLOT_W-1:0]      e_dbuf_base,     // entry's RD-SRAM base slot
+  input  logic [SLOT_W-1:0]      e_dbuf_base,     // this channel's RD-SRAM base slot for the entry
   input  logic [ROB_IDX_W-1:0]   e_rob_idx,       // entry's ROB index
   input  logic                   e_ch_done,       // this entry's done bit for ch_id
   output logic                   set_done,        // set that bit this cycle
@@ -88,7 +90,7 @@ module rmc_cif_r_burst_spltr_ch #(
   wire owes_entry = entry_valid & ~e_ch_done;   // this engine still owes the current entry
 
   assign pkt_rob_idx  = e_rob_idx;
-  assign pkt_dbuf_adr = e_dbuf_base + SLOT_W'(k);
+  assign pkt_dbuf_adr = e_dbuf_base + SLOT_W'(m);   // packed per channel (base + own count)
   // dbuf-full is a per-channel issue stall (not a head/admit stall): if the RD-SRAM
   // has no slot for this packet, hold here - other channels and earlier packets drain.
   assign pkt_valid    = owes_entry & (k <  e_n_pkts) & pkt_dbuf_adr_ready;

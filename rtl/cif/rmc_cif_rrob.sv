@@ -41,7 +41,8 @@ module rmc_cif_rrob #(
   localparam int CNT_W      = (MAX_PKTS  > 1) ? $clog2(MAX_PKTS+1) : 1, // packet-count width
   localparam int REQ_META_W = AXI_IDW + 1,                    // admit payload {id, validated}
   localparam int SLOT_PTR_W = (N_SLOTS > 1) ? $clog2(N_SLOTS) : 1, // RD-SRAM head-slot width
-  localparam int META_W     = 8 + 3 + PKT_OFF_W + SLOT_PTR_W  // resp meta {len8,size3,offset,head_ptr}
+  localparam int META_W     = 8 + 3 + PKT_OFF_W + CH_W + N_CH*SLOT_PTR_W
+                              // resp meta {len8, size3, offset, base_ch, head[N_CH]}
 )(
   input  logic                   aclk,
   input  logic                   aresetn,
@@ -71,14 +72,16 @@ module rmc_cif_rrob #(
   input  logic [PKT_OFF_W-1:0]   SEG_OFFSET,       // unaligned start offset
   input  logic [7:0]             SEG_LEN,          // ar_len  (beats-1)
   input  logic [2:0]             SEG_SIZE,         // ar_size (log2 beat bytes)
-  input  logic [SLOT_PTR_W-1:0]  SEG_HEAD_PTR,     // RD-SRAM head slot
+  input  logic [N_CH-1:0][SLOT_PTR_W-1:0] SEG_HEAD_PTR, // per-channel RD-SRAM head slots
+  input  logic [CH_W-1:0]        SEG_BASE_CH,      // start channel (line 0) for the resp walk
 
   // retire / R response
   output logic                   RESP_VALID,
   input  logic                   RESP_READY,
   output logic [AXI_IDW-1:0]     RESP_ID,
   output logic [1:0]             RESP_RESP,        // 00 OKAY / 10 SLVERR
-  output logic [SLOT_PTR_W-1:0]  RESP_HEAD_PTR,    // RD-SRAM head slot
+  output logic [N_CH-1:0][SLOT_PTR_W-1:0] RESP_HEAD_PTR, // per-channel RD-SRAM head slots
+  output logic [CH_W-1:0]        RESP_BASE_CH,     // start channel (orders the read walk)
   output logic [PKT_OFF_W-1:0]   RESP_OFFSET,      // start byte offset (pre/post trim)
   output logic [7:0]             RESP_LEN,         // ar_len
   output logic [2:0]             RESP_SIZE         // ar_size
@@ -123,15 +126,17 @@ module rmc_cif_rrob #(
   assign RESP_RESP  = (ent_err[retire_ptr] | ent_derr[retire_ptr]) ? 2'b10 : 2'b00;
   wire retire_fire  = RESP_VALID & RESP_READY;  // oldest entry pops this cycle
 
-  // metadata RAM: written at SEG_LAST from rseg, read out on the resp extras
-  // layout (MSB->LSB): {len[8], size[3], start_offset[PKT_OFF_W], head_mem_ptr[SLOT_PTR_W]}
+  // metadata RAM: written at SEG_LAST from rseg, read out on the resp extras. Layout
+  // (MSB->LSB): {len[8], size[3], offset[PKT_OFF_W], base_ch[CH_W], head[N_CH*SLOT_PTR_W]}
+  localparam int HEAD_W = N_CH*SLOT_PTR_W;
   logic [META_W-1:0] mem_meta [ROB_DEPTH];      // per-slot resp meta (trim info)
   always_ff @(posedge aclk)
-    if (SEG_LAST) mem_meta[SEG_ROB_IDX] <= {SEG_LEN, SEG_SIZE, SEG_OFFSET, SEG_HEAD_PTR};
+    if (SEG_LAST) mem_meta[SEG_ROB_IDX] <= {SEG_LEN, SEG_SIZE, SEG_OFFSET, SEG_BASE_CH, SEG_HEAD_PTR};
   assign RESP_LEN      = mem_meta[retire_ptr][META_W-1 -: 8];
-  assign RESP_SIZE     = mem_meta[retire_ptr][SLOT_PTR_W+PKT_OFF_W +: 3];
-  assign RESP_OFFSET   = mem_meta[retire_ptr][SLOT_PTR_W +: PKT_OFF_W];
-  assign RESP_HEAD_PTR = mem_meta[retire_ptr][SLOT_PTR_W-1:0];
+  assign RESP_SIZE     = mem_meta[retire_ptr][HEAD_W+CH_W+PKT_OFF_W +: 3];
+  assign RESP_OFFSET   = mem_meta[retire_ptr][HEAD_W+CH_W +: PKT_OFF_W];
+  assign RESP_BASE_CH  = mem_meta[retire_ptr][HEAD_W +: CH_W];
+  assign RESP_HEAD_PTR = mem_meta[retire_ptr][HEAD_W-1:0];
 
   // all flop updates (admit / SEG_LAST / cmpl / retire are parallel)
   always_ff @(posedge aclk or negedge aresetn) begin

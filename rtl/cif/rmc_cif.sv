@@ -175,7 +175,8 @@ module rmc_cif #(
   logic [PKT_OFF_W-1:0]   ar_seg_offset;
   logic [7:0]             ar_seg_len;
   logic [2:0]             ar_seg_size;
-  logic [SLOT_W-1:0]      ar_seg_head_ptr;
+  logic [N_CH-1:0][SLOT_W-1:0] ar_seg_head_ptr;   // per-channel RD-SRAM head slots
+  logic [CH_W-1:0]        ar_seg_base_ch;         // start channel for the resp walk
 
   // admit both together: the ROB slot and the segmenter queue entry are allocated on the
   // same cycle, so gate each on the other's readiness.
@@ -201,7 +202,7 @@ module rmc_cif #(
     .req_addr     (araddr),
     .req_len      (arlen),
     .req_size     (arsize),
-    .req_dbuf_base(/* TODO: RD-SRAM slot allocator */),
+    .req_dbuf_base('0),  // TODO: N per-channel base pointers from the RD-SRAM allocator
     .req_rob_idx  (ar_rob_idx),
     .ready        (ar_rseg_ready),
     .pkt_valid    (/* TODO: per-channel req FIFO */),
@@ -216,7 +217,8 @@ module rmc_cif #(
     .seg_offset   (ar_seg_offset),
     .seg_len      (ar_seg_len),
     .seg_size     (ar_seg_size),
-    .seg_head_ptr (ar_seg_head_ptr)
+    .seg_head_ptr (ar_seg_head_ptr),
+    .seg_base_ch  (ar_seg_base_ch)
   );
 
   // write segmenter - still a stub. TODO: mirror rseg (ring + per-channel engines) with
@@ -264,7 +266,8 @@ module rmc_cif #(
     .SEG_OFFSET     (ar_seg_offset),
     .SEG_LEN        (ar_seg_len),
     .SEG_SIZE       (ar_seg_size),
-    .SEG_HEAD_PTR   (ar_seg_head_ptr)
+    .SEG_HEAD_PTR   (ar_seg_head_ptr),
+    .SEG_BASE_CH    (ar_seg_base_ch)
     // TODO: RESP_* -> R response path
   );
 

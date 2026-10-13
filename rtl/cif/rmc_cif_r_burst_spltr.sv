@@ -50,7 +50,9 @@ module rmc_cif_r_burst_spltr #(
   input  logic [AXI_AW-1:0]      req_addr,         // byte start address
   input  logic [LEN_W-1:0]       req_len,          // ar_len  (beats-1)
   input  logic [SIZE_W-1:0]      req_size,         // ar_size (log2 beat bytes)
-  input  logic [SLOT_W-1:0]      req_dbuf_base,    // RD-SRAM base slot for this request
+  // per-channel RD-SRAM base slots: each channel has its own SRAM and its own write
+  // pointer, so a map that hammers one channel does not disturb another's packing.
+  input  logic [N_CH-1:0][SLOT_W-1:0]    req_dbuf_base,
   input  logic [ROB_IDX_W-1:0]   req_rob_idx,      // pre-allocated ROB index (rides the entry)
   output logic                   ready,            // ~full: queue can accept a request
 
@@ -60,17 +62,19 @@ module rmc_cif_r_burst_spltr #(
   input  logic [N_CH-1:0]                pkt_dbuf_adr_ready, // RD-SRAM has a slot for it
   output logic [N_CH-1:0][ROB_IDX_W-1:0] pkt_rob_idx,  // owning request's ROB index
   output logic [N_CH-1:0][DADDR_W-1:0]   pkt_daddr,    // mapped DRAM coords for the line
-  output logic [N_CH-1:0][SLOT_W-1:0]    pkt_dbuf_adr, // RD-SRAM slot = dbuf_base + k
+  output logic [N_CH-1:0][SLOT_W-1:0]    pkt_dbuf_adr, // this channel's RD-SRAM slot = base + m
 
-  // to the ROB: one pulse when an entry is fully segmented (in-order head pop),
-  // plus the read meta the ROB latches for the R-response trim.
+  // to the ROB: one pulse when an entry is fully segmented (in-order head pop), plus the
+  // read meta the ROB latches for the R-response trim. The read path rebuilds each line's
+  // slot from these N head pointers + the start channel + offset/len/size + the map.
   output logic                   seg_last,         // a request finished splitting
   output logic [ROB_IDX_W-1:0]   seg_rob_idx,      // which ROB entry it was
   output logic [CNT_W-1:0]       seg_npkts,        // its total packet count
   output logic [PKT_OFF_W-1:0]   seg_offset,       // unaligned start offset addr[5:0]
   output logic [LEN_W-1:0]       seg_len,          // ar_len  (beats-1)
   output logic [SIZE_W-1:0]      seg_size,         // ar_size (log2 beat bytes)
-  output logic [SLOT_W-1:0]      seg_head_ptr      // RD-SRAM head slot (= dbuf_base)
+  output logic [N_CH-1:0][SLOT_W-1:0] seg_head_ptr, // per-channel RD-SRAM head slots
+  output logic [CH_W-1:0]        seg_base_ch       // channel of line 0 (orders the resp walk)
 );
 
   // Complete as a splitter. Remaining integration / open items live in rmc_cif.sv
@@ -86,7 +90,7 @@ module rmc_cif_r_burst_spltr #(
   logic [CNT_W-1:0]     q_npkts        [QUEUE_DEPTH];   // packets this request splits into
   logic [LEN_W-1:0]     q_len          [QUEUE_DEPTH];   // ar_len  -> resp trim
   logic [SIZE_W-1:0]    q_size         [QUEUE_DEPTH];   // ar_size -> resp trim
-  logic [SLOT_W-1:0]    q_dbuf_base    [QUEUE_DEPTH];   // RD-SRAM head slot (= seg_head_ptr)
+  logic [N_CH-1:0][SLOT_W-1:0] q_dbuf_base [QUEUE_DEPTH]; // per-channel RD-SRAM head slots
   logic [ROB_IDX_W-1:0] q_rob_idx      [QUEUE_DEPTH];   // pre-allocated ROB index
   logic [N_CH-1:0]      ch_done        [QUEUE_DEPTH];   // per-channel "done this slot" bits
 
@@ -151,7 +155,7 @@ module rmc_cif_r_burst_spltr #(
         .entry_valid    (eng_rd_ptr[c] != alloc_ptr),
         .e_aligned_base (q_aligned_base[rdi]),
         .e_n_pkts       (q_npkts[rdi]),
-        .e_dbuf_base    (q_dbuf_base[rdi]),
+        .e_dbuf_base    (q_dbuf_base[rdi][c]),
         .e_rob_idx      (q_rob_idx[rdi]),
         .e_ch_done      (ch_done[rdi][c]),
         .set_done       (eng_set_done[c]),
@@ -176,7 +180,8 @@ module rmc_cif_r_burst_spltr #(
   assign seg_offset   = q_offset[pop_idx];
   assign seg_len      = q_len[pop_idx];
   assign seg_size     = q_size[pop_idx];
-  assign seg_head_ptr = q_dbuf_base[pop_idx];
+  assign seg_head_ptr = q_dbuf_base[pop_idx];               // all N per-channel heads
+  assign seg_base_ch  = q_aligned_base[pop_idx][CH_W-1:0];  // start channel (line 0)
 
   // queue flops
   // Three parallel updates: enqueue writes a new tail slot and bumps alloc_ptr; ch_done
