@@ -1,146 +1,116 @@
 // rmc_cif_rseg_ch.sv
-// READ burst segmenter - one channel. Instanced once per DRAM channel by rmc_cif_rseg.
+// READ burst segmenter - one channel, ring walker. Instanced once per DRAM channel by
+// rmc_cif_rseg. Walks the shared pre-ROB queue at its own pace (own rd_ptr), issuing
+// only the 64B packets that land in its channel (ch_id), and marks the entry done for
+// this channel when its share is drained.
 //
-// Given a read request {base addr, len, size, dbuf_base, rob_idx} and the live address
-// map, this unit issues only the 64B-line packets that land in ITS channel (my_ch),
-// one CAS each, to its channel's req FIFO. No ROB, ring, or queue here - just the
-// per-channel issue engine.
-//
-// The unaligned start offset addr[5:0] is NOT consumed or zeroed: it is read for the
-// n_pkts count and also passed straight out on seg_offset, riding unchanged to the ROB
-// for response-path trimming.
+// The queue entry {aligned_base, n_pkts, dbuf_base, rob_idx} is presented by the
+// wrapper, muxed at this engine's rd_ptr. n_pkts and the start offset are computed at
+// enqueue; this engine never touches the offset bits.
 //
 // STRIDE (contract map: ch = low CH_W bits of the line number):
-//   consecutive lines round-robin channels with period N_CH, so this channel's lines
-//   are an arithmetic sequence. With base_ch = line[CH_W-1:0] (= addr[6 +: CH_W]):
-//     k0 = (my_ch - base_ch) mod N_CH          first packet index in the request
-//     k  = k0, k0+N_CH, k0+2*N_CH, ...          each subsequent channel-my_ch packet
-//   line addr = (aligned_base + k) << 6 ; addrmap(line) -> daddr (DRAM coords).
-//   dbuf slot = dbuf_base + k (global contiguous).
+//   base_ch = aligned_base[CH_W-1:0]
+//   k0      = (ch_id - base_ch) mod N_CH           first packet index of this channel
+//   k       = k0 + m*N_CH                           m = packets of this channel issued so far
+//   line addr = (aligned_base + k) << 6 ; addrmap(line) -> daddr. dbuf = dbuf_base + k.
+// Assumes the ch field is the low contiguous line field (contract/default map).
 //
-// Assumes the ch field is the low contiguous line field (the contract/default map).
-// A scattered CSR map would need a scan instead - not built here.
-
+// ---- EXPECTED BEHAVIOR (for FV) ----
+//   E1 route : every issued packet maps to ch_id (addrmap(line).ch == ch_id).
+//   E2 valid : pkt_valid only when entry_valid & ~e_ch_done & k < e_n_pkts; m (hence k)
+//              advances only on pkt_valid & pkt_ready.
+//   E3 done  : set_done asserts once per entry when k reaches e_n_pkts (incl. the
+//              zero-packet case k0 >= n_pkts); rd_ptr advances then, m resets.
+//   E4 ptr   : rd_ptr only advances (set_done | skip); never passes alloc_ptr
+//              (entry_valid gates work), so it never reads a freed/unwritten slot.
+//
 import rmc_cfg_pkg::*;
 
 module rmc_cif_rseg_ch #(
-  parameter int ROB_DEPTH = 32,         // ROB entries (rob_idx width) [root knob]
-  parameter int MAX_PKTS  = 64,         // max packets per request     [root knob]
-  parameter int AXI_AW    = SYS_ADDR_W, // AXI address width           [root knob]
-  parameter int N_SLOTS   = 32,         // RD-SRAM slots               [root knob]
+  parameter int ROB_DEPTH   = 32,         // ROB entries (rob_idx width)   [root knob]
+  parameter int MAX_PKTS    = 64,         // max packets per request       [root knob]
+  parameter int AXI_AW      = SYS_ADDR_W, // AXI address width             [root knob]
+  parameter int N_SLOTS     = 32,         // RD-SRAM slots                 [root knob]
+  parameter int QUEUE_DEPTH = ROB_DEPTH,  // pre-ROB queue entries; = ROB_DEPTH (pow2)  [knob]
 
   // derived (localparam: never passed in)
-  localparam int ROB_IDX_W  = (ROB_DEPTH > 1) ? $clog2(ROB_DEPTH)  : 1,
-  localparam int CNT_W      = (MAX_PKTS  > 1) ? $clog2(MAX_PKTS+1) : 1,
-  localparam int SLOT_W     = (N_SLOTS   > 1) ? $clog2(N_SLOTS)    : 1,
-  localparam int LINE_W     = AXI_AW - PKT_OFF_W,                    // 64B line number
-  localparam int DATA_BYTES = AXI_DW / 8,                           // = N_CH*8 (beat width)
-  localparam int SIZE_MAX   = (DATA_BYTES > 1) ? $clog2(DATA_BYTES) : 0,
-  localparam int MAX_BEATS  = MAX_REQ_BYTES / DATA_BYTES,
-  localparam int LEN_W      = (MAX_BEATS  > 1) ? $clog2(MAX_BEATS)  : 1, // awlen (beats-1)
-  localparam int SIZE_W     = (SIZE_MAX   > 0) ? $clog2(SIZE_MAX+1) : 1, // awsize
-  localparam int SPAN_W     = $clog2(MAX_REQ_BYTES + 1)             // bytes spanned (<=4KB)
+  localparam int ROB_IDX_W = (ROB_DEPTH   > 1) ? $clog2(ROB_DEPTH)   : 1,
+  localparam int CNT_W     = (MAX_PKTS    > 1) ? $clog2(MAX_PKTS+1)  : 1,
+  localparam int SLOT_W    = (N_SLOTS     > 1) ? $clog2(N_SLOTS)     : 1,
+  localparam int LINE_W    = AXI_AW - PKT_OFF_W,                     // 64B line number
+  localparam int QIDX_W    = (QUEUE_DEPTH > 1) ? $clog2(QUEUE_DEPTH) : 1,
+  localparam int QPTR_W    = QIDX_W + 1                              // extended (wrap bit)
 )(
   input  logic                   aclk,
   input  logic                   aresetn,
 
-  // which DRAM channel this instance owns
-  input  logic [CH_W-1:0]        my_ch,
-
-  // live address map (CSR)
+  input  logic [CH_W-1:0]        ch_id,           // the DRAM channel this engine serves
   input  logic [DEC_W-1:0][MAP_SEL_W-1:0] addr_map,
 
-  // request in. Captured on start & ready.
-  input  logic                   start,
-  input  logic [AXI_AW-1:0]      req_addr,
-  input  logic [LEN_W-1:0]       req_len,
-  input  logic [SIZE_W-1:0]      req_size,
-  input  logic [SLOT_W-1:0]      req_dbuf_base,
-  input  logic [ROB_IDX_W-1:0]   req_rob_idx,    // pre-allocated ROB index for this request
-  output logic                   ready,          // ~busy: can take a new request
+  // queue read: wrapper presents the entry at this engine's rd_ptr
+  output logic [QPTR_W-1:0]      rd_ptr,
+  input  logic                   entry_valid,     // rd_ptr != alloc_ptr (entry occupied)
+  input  logic [LINE_W-1:0]      e_aligned_base,
+  input  logic [CNT_W-1:0]       e_n_pkts,
+  input  logic [SLOT_W-1:0]      e_dbuf_base,
+  input  logic [ROB_IDX_W-1:0]   e_rob_idx,
+  input  logic                   e_ch_done,       // this entry's done bit for ch_id
+  output logic                   set_done,        // set that bit this cycle
 
   // packet stream out, this channel only
   output logic                   pkt_valid,
   input  logic                   pkt_ready,
-  output logic [ROB_IDX_W-1:0]   pkt_rob_idx,    // ROB index tag (MC completion routes by it)
-  output logic [DADDR_W-1:0]     pkt_daddr,      // mapped DRAM coords
-  output logic [SLOT_W-1:0]      pkt_dbuf_adr,   // RD-SRAM slot = dbuf_base + k
-
-  // request-level sideband that rides to the ROB (unchanged)
-  output logic [PKT_OFF_W-1:0]   seg_offset,     // unaligned start offset addr[5:0]
-
-  // done pulse: this channel's share of the request is fully issued
-  output logic                   done
+  output logic [ROB_IDX_W-1:0]   pkt_rob_idx,
+  output logic [DADDR_W-1:0]     pkt_daddr,
+  output logic [SLOT_W-1:0]      pkt_dbuf_adr
 );
 
-  // captured request (held through the issue walk)
-  logic                 busy;
-  logic [LINE_W-1:0]    aligned_base;   // base 64B line = req_addr >> 6
-  logic [PKT_OFF_W-1:0] offset;         // unaligned start offset addr[5:0]; rides to ROB
-  logic [SLOT_W-1:0]    dbuf_base;      // RD-SRAM base slot
-  logic [ROB_IDX_W-1:0] rob_idx;        // ROB index of the in-flight request
-  logic [CNT_W-1:0]     n_pkts;         // total 64B packets in the request
-  logic [CNT_W-1:0]     k;              // current line index within the request
+  logic [CNT_W-1:0] m;                 // packets of this channel issued for current entry
 
-  // --- combinational geometry of the incoming request (valid at start) ---
-  // span from the 64B line start = unaligned head + burst bytes; n_pkts = ceil(span/64).
-  logic [SPAN_W-1:0]    in_span;
-  logic [CNT_W-1:0]     in_npkts;
-  logic [CH_W-1:0]      in_base_ch;
-  logic [CH_W-1:0]      in_k0;
-  assign in_span    = SPAN_W'(req_addr[PKT_OFF_W-1:0]) + ((SPAN_W'(req_len) + 1'b1) << req_size);
-  assign in_npkts   = CNT_W'((in_span + SPAN_W'((1 << PKT_OFF_W) - 1)) >> PKT_OFF_W);
-  // contract map: channel = low CH_W bits of the line number (N_CH is a power of 2).
-  assign in_base_ch = req_addr[PKT_OFF_W +: CH_W];
-  assign in_k0      = (my_ch - in_base_ch) & CH_W'(N_CH - 1);
+  // first packet index for this channel (contract map; N_CH is a power of 2)
+  logic [CH_W-1:0]  base_ch;
+  logic [CH_W-1:0]  k0;
+  logic [CNT_W-1:0] k;
+  assign base_ch = e_aligned_base[CH_W-1:0];
+  assign k0      = (ch_id - base_ch) & CH_W'(N_CH - 1);
+  assign k       = CNT_W'(k0) + (CNT_W'(m) << CH_W);     // k0 + m*N_CH
 
-  assign ready = ~busy;
-
-  // per-packet address -> DRAM coords. line k sits at byte (aligned_base + k) << 6.
-  logic [AXI_AW-1:0]    line_sys_addr;
-  logic [CH_W-1:0]      line_ch_unused;
-  logic [PKT_OFF_W-1:0] line_off_unused;
-  assign line_sys_addr = AXI_AW'(aligned_base + k) << PKT_OFF_W;
+  // current line -> DRAM coords. map_ch/map_off are the map's other outputs; this engine
+  // trusts the stride for routing and leaves the write offset to the queue, so they idle.
+  logic [AXI_AW-1:0]    line_byte_addr;
+  logic [CH_W-1:0]      map_ch;
+  logic [PKT_OFF_W-1:0] map_off;
+  assign line_byte_addr = AXI_AW'(e_aligned_base + k) << PKT_OFF_W;
 
   rmc_cif_addrmap #(
     .AXI_AW  (AXI_AW),
     .DADDR_W (DADDR_W)
   ) u_map (
-    .sys_addr (line_sys_addr),
+    .sys_addr (line_byte_addr),
     .addr_map (addr_map),
     .daddr    (pkt_daddr),
-    .ch       (line_ch_unused),
-    .offset   (line_off_unused)
+    .ch       (map_ch),
+    .offset   (map_off)
   );
 
-  assign pkt_rob_idx  = rob_idx;
-  assign pkt_dbuf_adr = dbuf_base + SLOT_W'(k);
-  assign pkt_valid    = busy & (k < n_pkts);
-  assign seg_offset   = offset;                 // rides to ROB, untouched
-  assign done         = busy & (k >= n_pkts);   // walk finished (incl. zero-packet case)
+  wire have_work = entry_valid & ~e_ch_done;
+
+  assign pkt_rob_idx  = e_rob_idx;
+  assign pkt_dbuf_adr = e_dbuf_base + SLOT_W'(k);
+  assign pkt_valid    = have_work & (k <  e_n_pkts);
+  assign set_done     = have_work & (k >= e_n_pkts);     // my share drained (incl zero-pkt)
+
+  wire skip = entry_valid & e_ch_done;                   // already done here -> just advance
 
   always_ff @(posedge aclk or negedge aresetn) begin
     if (!aresetn) begin
-      busy         <= 1'b0;
-      aligned_base <= '0;
-      offset       <= '0;
-      dbuf_base    <= '0;
-      rob_idx      <= '0;
-      n_pkts       <= '0;
-      k            <= '0;
-    end else if (start & ready) begin
-      busy         <= 1'b1;
-      aligned_base <= req_addr[AXI_AW-1:PKT_OFF_W];
-      offset       <= req_addr[PKT_OFF_W-1:0];   // capture, pass through unchanged
-      dbuf_base    <= req_dbuf_base;
-      rob_idx      <= req_rob_idx;
-      n_pkts       <= in_npkts;
-      k            <= CNT_W'(in_k0);             // first packet for this channel
-    end else if (busy) begin
-      if (k >= n_pkts)
-        busy <= 1'b0;                            // done; drop busy
-      else if (pkt_valid & pkt_ready)
-        k <= k + CNT_W'(N_CH);                   // stride to next channel-my_ch packet
+      rd_ptr <= '0;
+      m      <= '0;
+    end else if (set_done | skip) begin
+      rd_ptr <= rd_ptr + 1'b1;                           // move to next entry
+      m      <= '0;
+    end else if (pkt_valid & pkt_ready) begin
+      m      <= m + 1'b1;                                // next channel-ch_id packet
     end
   end
 
