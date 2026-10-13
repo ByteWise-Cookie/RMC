@@ -3,14 +3,19 @@
 // order to drive the AXI R response path.
 //
 // Slot ring (no shift register, no per-slot valid bit):
-//   - alloc_ptr  : current fill/split slot; advances on SEG_LAST
+//   - alloc_ptr  : next free slot; advances on admit (many requests may be mid-split)
 //   - retire_ptr : oldest slot; advances on retire
 //   - occ        : entries in flight; gives full / empty
 //
+// Multi-outstanding: the pipelined rseg splits several requests at once, so admit is
+// decoupled from SEG_LAST. alloc_ptr advances at admit (handing ROB_IDX out); SEG_LAST
+// arrives later, carrying SEG_ROB_IDX to close that specific entry. rseg's seg_last is
+// in program order, but indexing by SEG_ROB_IDX keeps the ROB robust to it either way.
+//
 // One request:
-//   admit    : write {id, err} at alloc_ptr, clear counters, set pending_split
-//   handoff  : rseg captures ROB_IDX (= alloc_ptr) on req_in_valid & A_ID_READY
-//   SEG_LAST : inflow_complt=1, n_pkts=SEG_NPKTS, mem_meta <= {len,size,offset,head}
+//   admit    : write {id, err} at alloc_ptr, clear counters, advance alloc_ptr
+//   handoff  : rseg captures ROB_IDX (= alloc_ptr) on admit; it rides the request
+//   SEG_LAST : inflow_complt[SEG_ROB_IDX]=1, n_pkts=SEG_NPKTS, mem_meta <= {len,size,offset,head}
 //   cmpl     : outflow_cnt[rob_index]++ ; cmpl_err tags a downstream error
 //   retire   : when inflow_complt && outflow_cnt==n_pkts, drive RESP_* (id, resp, and
 //              the read meta head_ptr/offset/len/size for the resp-path trim), pop slot
@@ -47,8 +52,9 @@ module rmc_cif_rrob #(
   output logic                   A_ID_READY,       // free slot, none mid-split
 
   // rrob -> rseg handoff
-  output logic [ROB_IDX_W-1:0]   ROB_IDX,          // offered slot index (= alloc_ptr)
-  input  logic                   SEG_LAST,         // last packet issued
+  output logic [ROB_IDX_W-1:0]   ROB_IDX,          // offered slot index (= alloc_ptr), at admit
+  input  logic                   SEG_LAST,         // a request finished splitting
+  input  logic [ROB_IDX_W-1:0]   SEG_ROB_IDX,      // which entry it was (closes that slot)
   input  logic [CNT_W-1:0]       SEG_NPKTS,        // packet count (valid at SEG_LAST)
   // read meta from rseg, latched at SEG_LAST
   input  logic [PKT_OFF_W-1:0]   SEG_OFFSET,
@@ -91,11 +97,11 @@ module rmc_cif_rrob #(
   assign admit_id = AW_REQUEST[REQ_META_W-1 -: AXI_IDW];
   assign admit_ok = AW_REQUEST[0];
 
-  // handoff: A_ID_READY is the ROB's ready (also rseg's ROB_READY). pending_split
-  // holds it low through the split so the next admit waits.
-  logic pending_split;
+  // handoff: A_ID_READY is the ROB's ready. Multi-outstanding - admit only needs a free
+  // slot, so the segmenter can keep several requests in flight at once. ROB_IDX (the slot
+  // handed out) rides with the request and tags every packet for completion routing.
   wire  admit_fire = A_ID_VALID & A_ID_READY;
-  assign A_ID_READY = ~rob_full & ~pending_split;
+  assign A_ID_READY = ~rob_full;
   assign ROB_IDX    = alloc_ptr;
 
   // retire / response (comb)
@@ -110,7 +116,7 @@ module rmc_cif_rrob #(
   // layout (MSB->LSB): {len[8], size[3], start_offset[PKT_OFF_W], head_mem_ptr[SLOT_PTR_W]}
   logic [META_W-1:0] mem_meta [ROB_DEPTH];
   always_ff @(posedge aclk)
-    if (SEG_LAST) mem_meta[alloc_ptr] <= {SEG_LEN, SEG_SIZE, SEG_OFFSET, SEG_HEAD_PTR};
+    if (SEG_LAST) mem_meta[SEG_ROB_IDX] <= {SEG_LEN, SEG_SIZE, SEG_OFFSET, SEG_HEAD_PTR};
   assign RESP_LEN      = mem_meta[retire_ptr][META_W-1 -: 8];
   assign RESP_SIZE     = mem_meta[retire_ptr][SLOT_PTR_W+PKT_OFF_W +: 3];
   assign RESP_OFFSET   = mem_meta[retire_ptr][SLOT_PTR_W +: PKT_OFF_W];
@@ -122,21 +128,20 @@ module rmc_cif_rrob #(
       alloc_ptr     <= '0;
       retire_ptr    <= '0;
       occ           <= '0;
-      pending_split <= 1'b0;
     end else begin
+      // admit: claim the slot and advance alloc_ptr (decoupled from the split).
       if (admit_fire) begin
         ent_id[alloc_ptr]        <= admit_id;
         ent_err[alloc_ptr]       <= ~admit_ok;
         ent_derr[alloc_ptr]      <= 1'b0;
         inflow_complt[alloc_ptr] <= 1'b0;
         outflow_cnt[alloc_ptr]   <= '0;
-        pending_split            <= 1'b1;
-      end
-      if (SEG_LAST) begin
-        inflow_complt[alloc_ptr] <= 1'b1;
-        n_pkts[alloc_ptr]        <= SEG_NPKTS;
-        pending_split            <= 1'b0;
         alloc_ptr <= (alloc_ptr == PTR_W'(ROB_DEPTH-1)) ? '0 : alloc_ptr + 1'b1;
+      end
+      // SEG_LAST closes the entry named by SEG_ROB_IDX (not alloc_ptr): its split done.
+      if (SEG_LAST) begin
+        inflow_complt[SEG_ROB_IDX] <= 1'b1;
+        n_pkts[SEG_ROB_IDX]        <= SEG_NPKTS;
       end
       if (cmpl_valid) begin
         outflow_cnt[cmpl_rob_index] <= outflow_cnt[cmpl_rob_index] + 1'b1;
