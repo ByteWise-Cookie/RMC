@@ -31,6 +31,7 @@ module rmc_cif #(
   localparam int SRAM_W    = PKT_BYTES * 8,   // one 64B packet per line (= BL*DQ_W)
   localparam int ROB_IDX_W = (ROB_DEPTH > 1) ? $clog2(ROB_DEPTH) : 1,  // rob_index tag
   localparam int PKT_NUM_W = (MAX_PKTS > 1) ? $clog2(MAX_PKTS) : 1,
+  localparam int CNT_W     = (MAX_PKTS > 1) ? $clog2(MAX_PKTS+1) : 1,  // packet-count width
   localparam int SLOT_W    = (($clog2(N_WDB) > $clog2(N_RDB)) ?
                               $clog2(N_WDB) : $clog2(N_RDB)),
   localparam int DADDR_W   = RANK_W + BG_W + BANK_PER_BG_W + ROW_W + COL_W
@@ -147,13 +148,70 @@ module rmc_cif #(
   rmc_cif_reqvalidator #(.AXI_AW(AXI_AW)) u_val_ar (
     .req_addr (araddr), .req_len (arlen), .req_size (arsize), .req_ok (ar_ok));
 
-  // segmentation: read + write burst splitters, one per direction. Stubs - wiring
-  // TODO (ROB handoff, pre-ROB buffer, addr_map, per-channel req FIFOs).
+  // ====================================================================
+  // READ PATH LEFT TO DO (rseg/rrob control is wired; these remain):
+  //   - req_dbuf_base: the RD-SRAM slot allocator is not built; u_rseg's
+  //     req_dbuf_base is stubbed. Allocate a contiguous RD-SRAM base per
+  //     admitted read and feed it here.
+  //   - pkt_* -> MC: u_rseg emits N_CH per-channel packet streams, but this
+  //     block has a single async_mc_req_* port. Add per-channel req FIFOs +
+  //     an N_CH->1 arbiter (or widen the MC req interface to per-channel).
+  //   - dbuf addressing: global dbuf_base+k (per-channel SRAM sparse) vs a
+  //     packed per-channel index - open; affects RD-SRAM size + resp readback.
+  //   - scattered-map fallback: rseg assumes the contract map (ch = low CH_W
+  //     line bits); an arbitrary CSR map needs the scan path (not built).
+  //   - RESP_* from u_rrob -> the R response channel (drain RD-SRAM, trim).
+  // ====================================================================
+
+  // read segmenter <-> read ROB handoff nets
+  logic                   ar_rseg_ready;    // rseg queue has room
+  logic                   ar_rrob_rdy;      // rrob has a free slot (~rob_full)
+  logic                   ar_admit;         // a read request is admitted this cycle
+  logic [ROB_IDX_W-1:0]   ar_rob_idx;       // slot rrob hands out, rides with the request
+  logic                   ar_seg_last;      // a read request finished splitting
+  logic [ROB_IDX_W-1:0]   ar_seg_rob_idx;   // which entry it was
+  logic [CNT_W-1:0]       ar_seg_npkts;
+  logic [PKT_OFF_W-1:0]   ar_seg_offset;
+  logic [7:0]             ar_seg_len;
+  logic [2:0]             ar_seg_size;
+  logic [SLOT_W-1:0]      ar_seg_head_ptr;
+
+  // admit both together: the ROB slot and the segmenter queue entry are allocated on the
+  // same cycle, so gate each on the other's readiness.
+  assign ar_admit = arvalid & ar_rseg_ready & ar_rrob_rdy;
+
+  // read segmenter. TODO: req_dbuf_base from the RD-SRAM slot allocator (not built) and
+  // pkt_* -> the per-channel req async FIFOs (single async_mc_req_* port today; needs an
+  // N_CH->1 arbiter or a per-channel FIFO interface).
   rmc_cif_rseg #(
-    .ROB_DEPTH (ROB_DEPTH), .MAX_PKTS (MAX_PKTS), .AXI_AW (AXI_AW)
+    .ROB_DEPTH (ROB_DEPTH), .MAX_PKTS (MAX_PKTS), .AXI_AW (AXI_AW), .N_SLOTS (N_RDB)
   ) u_rseg (
-    .aclk (aclk), .aresetn (aresetn)
+    .aclk         (aclk),
+    .aresetn      (aresetn),
+    .addr_map     (addr_map),
+    .start_req    (ar_admit),
+    .req_addr     (araddr),
+    .req_len      (arlen),
+    .req_size     (arsize),
+    .req_dbuf_base(/* TODO: RD-SRAM slot allocator */),
+    .req_rob_idx  (ar_rob_idx),
+    .ready        (ar_rseg_ready),
+    .pkt_valid    (/* TODO: per-channel req FIFO */),
+    .pkt_ready    (/* TODO */),
+    .pkt_rob_idx  (/* TODO */),
+    .pkt_daddr    (/* TODO */),
+    .pkt_dbuf_adr (/* TODO */),
+    .seg_last     (ar_seg_last),
+    .seg_rob_idx  (ar_seg_rob_idx),
+    .seg_npkts    (ar_seg_npkts),
+    .seg_offset   (ar_seg_offset),
+    .seg_len      (ar_seg_len),
+    .seg_size     (ar_seg_size),
+    .seg_head_ptr (ar_seg_head_ptr)
   );
+
+  // write segmenter - still a stub. TODO: mirror rseg (ring + per-channel engines) with
+  // free-list slots + chain; wire to u_wrob and the W/AW path.
   rmc_cif_wseg #(
     .ROB_DEPTH (ROB_DEPTH), .MAX_PKTS (MAX_PKTS), .AXI_AW (AXI_AW)
   ) u_wseg (
@@ -174,19 +232,31 @@ module rmc_cif #(
   // built yet - for now admit is wired straight from the validator + AXI channel.
 
   // read ROB. admit direct from AR channel + validator (AR_req buffer not built yet).
+  // A_ID_VALID is gated by rseg readiness so the ROB slot and the segmenter queue entry
+  // allocate together; arready reflects both. RESP_* -> R response path is still TODO.
+  assign arready = ar_rseg_ready & ar_rrob_rdy;
   rmc_cif_rrob #(
     .ROB_DEPTH (ROB_DEPTH),
     .MAX_PKTS  (MAX_PKTS),
-    .AXI_IDW   (AXI_IDW)
+    .AXI_IDW   (AXI_IDW),
+    .N_SLOTS   (N_RDB)
   ) u_rrob (
     .aclk           (aclk),
     .aresetn        (aresetn),
     .cmpl_valid     (async_mc_cmpl_valid),
     .cmpl_rob_index (async_mc_cmpl_rob_index),
     .AW_REQUEST     ({arid, arlen, arsize, ar_ok}),
-    .A_ID_VALID     (arvalid),
-    .A_ID_READY     (arready)
-    // TODO: SEG_* from u_rseg; RESP_* -> R response path
+    .A_ID_VALID     (arvalid & ar_rseg_ready),
+    .A_ID_READY     (ar_rrob_rdy),
+    .ROB_IDX        (ar_rob_idx),
+    .SEG_LAST       (ar_seg_last),
+    .SEG_ROB_IDX    (ar_seg_rob_idx),
+    .SEG_NPKTS      (ar_seg_npkts),
+    .SEG_OFFSET     (ar_seg_offset),
+    .SEG_LEN        (ar_seg_len),
+    .SEG_SIZE       (ar_seg_size),
+    .SEG_HEAD_PTR   (ar_seg_head_ptr)
+    // TODO: RESP_* -> R response path
   );
 
   // write ROB. admit direct from AW channel + validator (AW_req buffer not built yet).
