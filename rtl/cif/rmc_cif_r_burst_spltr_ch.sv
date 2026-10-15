@@ -118,7 +118,7 @@ module rmc_cif_r_burst_spltr_ch #(
   always_comb
     for (int i = 0; i < PG_LINES; i++)
       mine_comb[i] = (LN_W'(i) >= l0)
-                   & (line_channel(line_byte(LN_W'(i)), addr_map, cfg_n_ch_log2) == ch_id);
+                   & (rmc_cfg_pkg::line_channel(line_byte(LN_W'(i)), addr_map, cfg_n_ch_log2) == ch_id);
   assign mine_cur = active ? mine_reg : mine_comb;
 
   logic [LN_W-1:0] sel_i;

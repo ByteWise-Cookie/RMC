@@ -184,7 +184,7 @@ module rmc_cif_r_burst_spltr #(
   always_comb
     for (int i = 0; i < PG_LINES; i++) begin
       in_range[i]  = (LN_W'(i) >= l0) & (LN_W'(i) <= l_last);
-      line_ch_v[i] = line_channel(s0_line_byte(LN_W'(i)), addr_map, cfg_n_ch_log2);
+      line_ch_v[i] = rmc_cfg_pkg::line_channel(s0_line_byte(LN_W'(i)), addr_map, cfg_n_ch_log2);
     end
 
   logic [N_CH-1:0][CNT_W-1:0] ch_pkts, ch_pkts_eff;

@@ -152,8 +152,8 @@ module rmc_cif_r_burst_spltr_fv #(
     for (int c = 0; c < N_CH_L; c++) ref_chpkts[c] = '0;
     for (int i = 0; i < PG_LINES; i++)
       if ((LN_W'(i) >= ref_l0_b) && (LN_W'(i) <= ref_llast_b))
-        ref_chpkts[line_channel(ref_line_byte(LN_W'(i)), addr_map, cfg_n_ch_log2)]
-          = ref_chpkts[line_channel(ref_line_byte(LN_W'(i)), addr_map, cfg_n_ch_log2)] + CNT_W'(1);
+        ref_chpkts[rmc_cfg_pkg::line_channel(ref_line_byte(LN_W'(i)), addr_map, cfg_n_ch_log2)]
+          = ref_chpkts[rmc_cfg_pkg::line_channel(ref_line_byte(LN_W'(i)), addr_map, cfg_n_ch_log2)] + CNT_W'(1);
   end
 
   // ------------------------------------------------------------------------
