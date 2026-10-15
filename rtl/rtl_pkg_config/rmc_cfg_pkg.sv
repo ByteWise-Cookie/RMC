@@ -137,4 +137,21 @@ package rmc_cfg_pkg;
     return m;
   endfunction
 
+  // Channel a byte address maps to, under a live map. This is exactly the ch slice of the
+  // addr_map decode (ch = dec[PKT_OFF_W +: CH_W], dec[b] = byte_addr[addr_map[b]]) with the
+  // active-channel mask applied: CH bits at or above n_ch_log2 are forced 0, folding
+  // inactive channels away. The read burst splitter's precompute (per-line counts) and its
+  // per-channel engines (line select) BOTH call this, so a count can never disagree with the
+  // mask it is checked against. Keep this the single source of the channel decode.
+  function automatic logic [CH_W-1:0] line_channel(
+      input logic [SYS_ADDR_W-1:0]           byte_addr,
+      input logic [DEC_W-1:0][MAP_SEL_W-1:0] amap,
+      input logic [$clog2(CH_W+1)-1:0]       n_ch_log2);
+    logic [CH_W-1:0] c;
+    c = '0;
+    for (int k = 0; k < CH_W; k++)
+      c[k] = (k < int'(n_ch_log2)) ? byte_addr[ amap[PKT_OFF_W + k] ] : 1'b0;
+    return c;
+  endfunction
+
 endpackage : rmc_cfg_pkg
