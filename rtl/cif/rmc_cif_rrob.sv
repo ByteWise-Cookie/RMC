@@ -52,28 +52,30 @@ module rmc_cif_rrob #(
   input  logic [ROB_IDX_W-1:0]   cmpl_rob_index,
   input  logic                   cmpl_err,         // downstream error -> SLVERR
 
-  // admit (from the pre-ROB AR_req buffer, post request_validator). Only {id, validated}
-  // here - addr/len/size ride the segmenter queue and come back as resp meta at SEG_LAST.
-  // n_pkts is known at enqueue, so it ships EARLY with admit (see ADMIT_NPKTS).
+  // admit (from the burst splitter). The splitter now works the whole request descriptor
+  // out at admit (per-line channel popcount), so the resp meta ships EARLY with admit, not
+  // at SEG_LAST: n_pkts, the trim fields (offset/len/size) and base_ch are all known now.
+  // A_ID_VALID is the splitter's admit_valid pulse; A_ID_READY = free slot. Only the
+  // per-channel head pointers are still unknown here - they arrive at SEG_LAST.
   input  logic [REQ_META_W-1:0]  AW_REQUEST,       // {A_ID, A_VALIDATED}
   input  logic [CNT_W-1:0]       ADMIT_NPKTS,      // total packets for this request (at admit)
+  input  logic [PKT_OFF_W-1:0]   ADMIT_OFFSET,     // unaligned start offset  (resp trim)
+  input  logic [7:0]             ADMIT_LEN,        // ar_len  (beats-1)       (resp trim)
+  input  logic [2:0]             ADMIT_SIZE,       // ar_size (log2 beat bytes)(resp trim)
+  input  logic [CH_W-1:0]        ADMIT_BASE_CH,    // start channel (line 0) for the resp walk
   input  logic                   A_ID_VALID,
   output logic                   A_ID_READY,       // free slot
 
-  // rrob -> rseg handoff. ROB_IDX (= alloc_ptr) is handed out at admit and rides the
-  // request; the entry is "filled" (n_pkts written) right then. Completions for it may
-  // arrive before the split even finishes, so n_pkts must already be valid - hence the
-  // early ship. SEG_LAST later marks the split done for that index and brings the resp
-  // meta; it no longer carries n_pkts.
-  output logic [ROB_IDX_W-1:0]   ROB_IDX,          // offered slot index (= alloc_ptr), at admit
+  // rrob -> splitter handoff. ROB_IDX (= alloc_ptr) is handed out at admit and rides the
+  // request; the entry is "filled" (n_pkts + trim meta) right then. Completions for it may
+  // arrive before the split even finishes, so those must already be valid - hence the early
+  // ship. SEG_LAST later marks the split done for that index and brings only the per-channel
+  // head pointers. Sample ROB_IDX only on admit (A_ID_VALID & A_ID_READY); it tracks
+  // alloc_ptr and is meaningless between admits.
+  output logic [ROB_IDX_W-1:0]   ROB_IDX,          // offered slot index (= alloc_ptr)
   input  logic                   SEG_LAST,         // a request finished splitting
   input  logic [ROB_IDX_W-1:0]   SEG_ROB_IDX,      // which entry it was (closes that slot)
-  // read meta from rseg, latched at SEG_LAST
-  input  logic [PKT_OFF_W-1:0]   SEG_OFFSET,       // unaligned start offset
-  input  logic [7:0]             SEG_LEN,          // ar_len  (beats-1)
-  input  logic [2:0]             SEG_SIZE,         // ar_size (log2 beat bytes)
-  input  logic [N_CH-1:0][SLOT_PTR_W-1:0] SEG_HEAD_PTR, // per-channel RD-SRAM head slots
-  input  logic [CH_W-1:0]        SEG_BASE_CH,      // start channel (line 0) for the resp walk
+  input  logic [N_CH-1:0][SLOT_PTR_W-1:0] SEG_HEAD_PTR, // per-channel RD-SRAM head slots (at SEG_LAST)
 
   // retire / R response
   output logic                   RESP_VALID,
@@ -126,17 +128,21 @@ module rmc_cif_rrob #(
   assign RESP_RESP  = (ent_err[retire_ptr] | ent_derr[retire_ptr]) ? 2'b10 : 2'b00;
   wire retire_fire  = RESP_VALID & RESP_READY;  // oldest entry pops this cycle
 
-  // metadata RAM: written at SEG_LAST from rseg, read out on the resp extras. Layout
-  // (MSB->LSB): {len[8], size[3], offset[PKT_OFF_W], base_ch[CH_W], head[N_CH*SLOT_PTR_W]}
-  localparam int HEAD_W = N_CH*SLOT_PTR_W;
-  logic [META_W-1:0] mem_meta [ROB_DEPTH];      // per-slot resp meta (trim info)
+  // resp meta, read out at retire for the resp-path trim. Split by when it is known:
+  //   mem_adm  {len, size, offset, base_ch} - written at ADMIT (all known then)
+  //   mem_head per-channel RD-SRAM head slots - written at SEG_LAST (filled by the engines)
+  logic [7:0]                      madm_len  [ROB_DEPTH];
+  logic [2:0]                      madm_size [ROB_DEPTH];
+  logic [PKT_OFF_W-1:0]            madm_off  [ROB_DEPTH];
+  logic [CH_W-1:0]                 madm_bch  [ROB_DEPTH];
+  logic [N_CH-1:0][SLOT_PTR_W-1:0] mem_head  [ROB_DEPTH];
   always_ff @(posedge aclk)
-    if (SEG_LAST) mem_meta[SEG_ROB_IDX] <= {SEG_LEN, SEG_SIZE, SEG_OFFSET, SEG_BASE_CH, SEG_HEAD_PTR};
-  assign RESP_LEN      = mem_meta[retire_ptr][META_W-1 -: 8];
-  assign RESP_SIZE     = mem_meta[retire_ptr][HEAD_W+CH_W+PKT_OFF_W +: 3];
-  assign RESP_OFFSET   = mem_meta[retire_ptr][HEAD_W+CH_W +: PKT_OFF_W];
-  assign RESP_BASE_CH  = mem_meta[retire_ptr][HEAD_W +: CH_W];
-  assign RESP_HEAD_PTR = mem_meta[retire_ptr][HEAD_W-1:0];
+    if (SEG_LAST) mem_head[SEG_ROB_IDX] <= SEG_HEAD_PTR;
+  assign RESP_LEN      = madm_len [retire_ptr];
+  assign RESP_SIZE     = madm_size[retire_ptr];
+  assign RESP_OFFSET   = madm_off [retire_ptr];
+  assign RESP_BASE_CH  = madm_bch [retire_ptr];
+  assign RESP_HEAD_PTR = mem_head [retire_ptr];
 
   // all flop updates (admit / SEG_LAST / cmpl / retire are parallel)
   always_ff @(posedge aclk or negedge aresetn) begin
@@ -145,7 +151,7 @@ module rmc_cif_rrob #(
       retire_ptr    <= '0;
       occ           <= '0;
     end else begin
-      // admit: claim the slot, write n_pkts (known now), advance alloc_ptr.
+      // admit: claim the slot, write n_pkts + the trim meta (all known now), advance alloc_ptr.
       if (admit_fire) begin
         ent_id[alloc_ptr]        <= admit_id;
         ent_err[alloc_ptr]       <= ~admit_ok;
@@ -153,10 +159,14 @@ module rmc_cif_rrob #(
         inflow_complt[alloc_ptr] <= 1'b0;
         outflow_cnt[alloc_ptr]   <= '0;
         n_pkts[alloc_ptr]        <= ADMIT_NPKTS;
+        madm_len[alloc_ptr]      <= ADMIT_LEN;
+        madm_size[alloc_ptr]     <= ADMIT_SIZE;
+        madm_off[alloc_ptr]      <= ADMIT_OFFSET;
+        madm_bch[alloc_ptr]      <= ADMIT_BASE_CH;
         alloc_ptr <= (alloc_ptr == PTR_W'(ROB_DEPTH-1)) ? '0 : alloc_ptr + 1'b1;
       end
       // SEG_LAST closes the entry named by SEG_ROB_IDX (not alloc_ptr): its split done.
-      // n_pkts was already written at admit; here only inflow + the resp meta land.
+      // n_pkts + trim meta were written at admit; here only inflow + the head pointers land.
       if (SEG_LAST)
         inflow_complt[SEG_ROB_IDX] <= 1'b1;
       if (cmpl_valid) begin

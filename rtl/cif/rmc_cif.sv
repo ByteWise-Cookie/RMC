@@ -164,61 +164,74 @@ module rmc_cif #(
   //   - RESP_* from u_rrob -> the R response channel (drain RD-SRAM, trim).
   // ====================================================================
 
-  // read segmenter <-> read ROB handoff nets
-  logic                   ar_rseg_ready;    // rseg queue has room
-  logic                   ar_rrob_rdy;      // rrob has a free slot (~rob_full)
-  logic                   ar_admit;         // a read request is admitted this cycle
-  logic [ROB_IDX_W-1:0]   ar_rob_idx;       // slot rrob hands out, rides with the request
-  logic                   ar_seg_last;      // a read request finished splitting
-  logic [ROB_IDX_W-1:0]   ar_seg_rob_idx;   // which entry it was
-  logic [CNT_W-1:0]       ar_seg_npkts;
-  logic [PKT_OFF_W-1:0]   ar_seg_offset;
-  logic [7:0]             ar_seg_len;
-  logic [2:0]             ar_seg_size;
-  logic [N_CH-1:0][SLOT_W-1:0] ar_seg_head_ptr;   // per-channel RD-SRAM head slots
-  logic [CH_W-1:0]        ar_seg_base_ch;         // start channel for the resp walk
+  // read splitter <-> read ROB handoff nets. Splitter-side widths for ar_len/ar_size and
+  // cfg_n_ch_log2 (mirror the splitter's own derivation so the port connections match).
+  localparam int R_DATA_BYTES = AXI_DW / 8;
+  localparam int R_MAX_BEATS  = MAX_REQ_BYTES / R_DATA_BYTES;
+  localparam int R_LEN_W      = (R_MAX_BEATS  > 1) ? $clog2(R_MAX_BEATS)  : 1;
+  localparam int R_SIZE_MAX   = (R_DATA_BYTES > 1) ? $clog2(R_DATA_BYTES) : 0;
+  localparam int R_SIZE_W     = (R_SIZE_MAX   > 0) ? $clog2(R_SIZE_MAX+1) : 1;
+  localparam int R_NCH_LOG_W  = $clog2(CH_W + 1);
 
-  // admit both together: the ROB slot and the segmenter queue entry are allocated on the
-  // same cycle, so gate each on the other's readiness.
-  assign ar_admit = arvalid & ar_rseg_ready & ar_rrob_rdy;
+  logic                        ar_rrob_rdy;     // rrob free slot (= ~rob_full) -> rob_free
+  logic [ROB_IDX_W-1:0]        ar_rob_idx;      // slot rrob offers (= its alloc_ptr)
+  logic                        ar_seg_last;     // a read request finished splitting
+  logic [ROB_IDX_W-1:0]        ar_seg_rob_idx;  // which entry it closes
+  logic [N_CH-1:0][SLOT_W-1:0] ar_seg_head_ptr; // per-channel RD-SRAM head slots (at seg_last)
 
-  // admit-time packet count for the ROB (known now; ships early so completions that beat
-  // the split still count). Same geometry rseg uses: size-aligned start + burst, ceil/64.
-  wire [PKT_OFF_W-1:0] ar_off_aligned = araddr[PKT_OFF_W-1:0]
-                                      & ~PKT_OFF_W'((SPAN_W'(1) << arsize) - 1'b1);
-  wire [SPAN_W-1:0]    ar_span   = SPAN_W'(ar_off_aligned) + ((SPAN_W'(arlen) + 1'b1) << arsize);
-  wire [CNT_W-1:0]     ar_npkts  = CNT_W'((ar_span + SPAN_W'((1 << PKT_OFF_W) - 1)) >> PKT_OFF_W);
+  // admit descriptor from the splitter. All known at admit, so it ships to the ROB early:
+  // completions that beat the split still count, and the resp trim meta is ready up front.
+  logic                   ar_admit_valid;
+  logic [AXI_IDW-1:0]     ar_admit_id;
+  logic                   ar_admit_validated;
+  logic [CNT_W-1:0]       ar_admit_npkts;
+  logic [11:0]            ar_admit_addr_lo;      // ar_addr[11:0]
+  logic [PKT_OFF_W-1:0]   ar_admit_offset;       // = ar_addr[5:0]
+  logic [R_LEN_W-1:0]     ar_admit_len;
+  logic [R_SIZE_W-1:0]    ar_admit_size;
+  logic [CH_W-1:0]        ar_admit_base_ch;
+  logic [N_CH-1:0]        ar_admit_ch_mask;
+  assign ar_admit_offset = ar_admit_addr_lo[PKT_OFF_W-1:0];
 
-  // read segmenter. TODO: req_dbuf_base from the RD-SRAM slot allocator (not built) and
-  // pkt_* -> the per-channel req async FIFOs (single async_mc_req_* port today; needs an
-  // N_CH->1 arbiter or a per-channel FIFO interface).
+  // read burst splitter. Owns the AR handshake (arready); the ROB only offers a free slot
+  // (rob_free/rob_idx) and allocates on admit_valid. TODO: pkt_* -> the per-channel req async
+  // FIFOs (single async_mc_req_* port today; needs an N_CH->1 arbiter) and pkt_dbuf_adr_ready
+  // from the RD-SRAM allocator (not built).
   rmc_cif_r_burst_spltr #(
     .ROB_DEPTH (ROB_DEPTH), .MAX_PKTS (MAX_PKTS), .AXI_AW (AXI_AW), .N_SLOTS (N_RDB)
   ) u_rseg (
-    .aclk         (aclk),
-    .aresetn      (aresetn),
-    .addr_map     (addr_map),
-    .start_req    (ar_admit),
-    .req_addr     (araddr),
-    .req_len      (arlen),
-    .req_size     (arsize),
-    .req_dbuf_base('0),  // TODO: N per-channel base pointers from the RD-SRAM allocator
-    .req_rob_idx  (ar_rob_idx),
-    .ready        (ar_rseg_ready),
-    .pkt_valid    (/* TODO: per-channel req FIFO */),
-    .pkt_ready    (/* TODO */),
-    .pkt_dbuf_adr_ready ({N_CH{1'b1}}),  // TODO: from RD-SRAM allocator (slot availability)
-    .pkt_rob_idx  (/* TODO */),
-    .pkt_daddr    (/* TODO */),
-    .pkt_dbuf_adr (/* TODO */),
-    .seg_last     (ar_seg_last),
-    .seg_rob_idx  (ar_seg_rob_idx),
-    .seg_npkts    (ar_seg_npkts),
-    .seg_offset   (ar_seg_offset),
-    .seg_len      (ar_seg_len),
-    .seg_size     (ar_seg_size),
-    .seg_head_ptr (ar_seg_head_ptr),
-    .seg_base_ch  (ar_seg_base_ch)
+    .aclk           (aclk),
+    .aresetn        (aresetn),
+    .addr_map       (addr_map),
+    .cfg_n_ch_log2  (R_NCH_LOG_W'(CH_W)),      // all channels active (boot CSR; constant now)
+    .ar_valid       (arvalid),
+    .ar_ready       (arready),
+    .ar_id          (arid),
+    .ar_addr        (araddr),
+    .ar_len         (R_LEN_W'(arlen)),
+    .ar_size        (R_SIZE_W'(arsize)),
+    .ar_validated   (ar_ok),
+    .rob_free       (ar_rrob_rdy),
+    .rob_idx        (ar_rob_idx),
+    .admit_valid    (ar_admit_valid),
+    .admit_id       (ar_admit_id),
+    .admit_validated(ar_admit_validated),
+    .admit_npkts    (ar_admit_npkts),
+    .admit_addr_lo  (ar_admit_addr_lo),
+    .admit_len      (ar_admit_len),
+    .admit_size     (ar_admit_size),
+    .admit_base_ch  (ar_admit_base_ch),
+    .admit_ch_mask  (ar_admit_ch_mask),
+    .pkt_valid      (/* TODO: per-channel req FIFO */),
+    .pkt_ready      ({N_CH{1'b0}}),            // TODO: from the per-channel req FIFO
+    .pkt_dbuf_adr_ready ({N_CH{1'b1}}),        // TODO: from RD-SRAM allocator (slot availability)
+    .pkt_rob_idx    (/* TODO */),
+    .pkt_daddr      (/* TODO */),
+    .pkt_dbuf_adr   (/* TODO */),
+    .seg_last       (ar_seg_last),
+    .seg_rob_idx    (ar_seg_rob_idx),
+    .seg_head_ptr   (ar_seg_head_ptr),
+    .idle           (/* TODO */)
   );
 
   // write segmenter - still a stub. TODO: mirror rseg (ring + per-channel engines) with
@@ -242,10 +255,10 @@ module rmc_cif #(
   // on AW_REQUEST/A_ID_VALID and backpressures via A_ID_READY. The buffer is not
   // built yet - for now admit is wired straight from the validator + AXI channel.
 
-  // read ROB. admit direct from AR channel + validator (AR_req buffer not built yet).
-  // A_ID_VALID is gated by rseg readiness so the ROB slot and the segmenter queue entry
-  // allocate together; arready reflects both. RESP_* -> R response path is still TODO.
-  assign arready = ar_rseg_ready & ar_rrob_rdy;
+  // read ROB. The splitter owns arready (admit backpressure); the ROB just presents a free
+  // slot (A_ID_READY -> the splitter's rob_free) and allocates when the splitter admits
+  // (A_ID_VALID = admit_valid). The resp meta now lands at admit; only the per-channel head
+  // pointers arrive at seg_last. RESP_* -> R response path is still TODO.
   rmc_cif_rrob #(
     .ROB_DEPTH (ROB_DEPTH),
     .MAX_PKTS  (MAX_PKTS),
@@ -256,18 +269,18 @@ module rmc_cif #(
     .aresetn        (aresetn),
     .cmpl_valid     (async_mc_cmpl_valid),
     .cmpl_rob_index (async_mc_cmpl_rob_index),
-    .AW_REQUEST     ({arid, ar_ok}),
-    .ADMIT_NPKTS    (ar_npkts),
-    .A_ID_VALID     (arvalid & ar_rseg_ready),
+    .AW_REQUEST     ({ar_admit_id, ar_admit_validated}),
+    .ADMIT_NPKTS    (ar_admit_npkts),
+    .ADMIT_OFFSET   (ar_admit_offset),
+    .ADMIT_LEN      (8'(ar_admit_len)),
+    .ADMIT_SIZE     (3'(ar_admit_size)),
+    .ADMIT_BASE_CH  (ar_admit_base_ch),
+    .A_ID_VALID     (ar_admit_valid),
     .A_ID_READY     (ar_rrob_rdy),
     .ROB_IDX        (ar_rob_idx),
     .SEG_LAST       (ar_seg_last),
     .SEG_ROB_IDX    (ar_seg_rob_idx),
-    .SEG_OFFSET     (ar_seg_offset),
-    .SEG_LEN        (ar_seg_len),
-    .SEG_SIZE       (ar_seg_size),
-    .SEG_HEAD_PTR   (ar_seg_head_ptr),
-    .SEG_BASE_CH    (ar_seg_base_ch)
+    .SEG_HEAD_PTR   (ar_seg_head_ptr)
     // TODO: RESP_* -> R response path
   );
 
