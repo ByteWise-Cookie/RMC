@@ -48,7 +48,8 @@ module rmc_cif_r_burst_spltr_ch #(
 
   // derived (localparam: never passed in)
   localparam int LINE_LSB   = PKT_OFF_W,                                // log2(64B line) = 6
-                                                                        // PAGE_LSB / PG_LINES: rmc_cfg_pkg (single source)
+  localparam int PAGE_LSB   = rmc_cfg_pkg::PAGE_LSB,                    // log2(4KB page), value from pkg
+  localparam int PG_LINES   = rmc_cfg_pkg::PG_LINES,                    // lines per page (64), value from pkg
   localparam int ROB_IDX_W  = (ROB_DEPTH   > 1) ? $clog2(ROB_DEPTH)   : 1, // rob_idx width
   localparam int CNT_W      = (MAX_PKTS    > 1) ? $clog2(MAX_PKTS+1)  : 1, // packet count width
   localparam int SLOT_W     = (N_SLOTS     > 1) ? $clog2(N_SLOTS)     : 1, // RD-SRAM slot width
