@@ -1,0 +1,79 @@
+rmc_cif_rrob properties         code: rmc_cif_rrob_fv.sv
+
+  ->   implies, same cycle          =>   implies, next cycle
+  [i]  per slot                     live[i]   = slot i admitted, not retired
+  admit  = A_ID_VALID & A_ID_READY  sealed[i] = slot i got its SEG_LAST
+  retire = RESP_VALID & RESP_READY  head = retire_ptr, tail = alloc_ptr
+  cmpl[i] = completions seen        exp_* = value captured by the model
+  many requests may be live and unsealed at once (pipelined rseg)
+
+
+ASSUME
+  m_reset_first   cycle 0: aresetn == 0
+  m_admit_npkts   admit -> 1 <= ADMIT_NPKTS <= MAX_PKTS
+  m_seg_last      SEG_LAST -> live[SEG_ROB_IDX] & !sealed[SEG_ROB_IDX]
+  m_cmpl          cmpl_valid -> live[cmpl_rob_index]
+                  cmpl_valid -> cmpl[idx] < n_pkts[idx]     (count known since admit)
+  (these three are ASSERTS in the join run, proven against the real splitter)
+
+  d4_live task only (fairness):
+  m_ready_fair    RESP_READY low for at most 4 cycles in a row
+  m_seg_fair      head live & !sealed -> SEG_LAST for head within 3 cycles
+  m_cmpl_fair     head sealed & cmpl[head] != n_pkts[head]
+                  -> completion for head within 3 cycles
+
+  free: A_ID_VALID AW_REQUEST(id, validated) SEG_OFFSET SEG_LEN SEG_SIZE SEG_HEAD_PTR RESP_READY
+        cmpl_err, order of SEG_LAST across slots, reset mid-run
+
+
+ASSERT  interface
+  a_ready         A_ID_READY == !full
+  a_no_reuse      admit -> !live[ROB_IDX]
+  a_idx           ROB_IDX == tail
+  a_resp_valid    RESP_VALID == live[head] & sealed[head] & (cmpl[head] == n_pkts[head])
+  a_resp_id       RESP_VALID -> RESP_ID == exp_id[head]
+  a_resp_resp     RESP_VALID -> RESP_RESP == (exp_slverr[head] ? 2'b10 : 2'b00)
+  a_resp_hold     RESP_VALID & !RESP_READY => RESP_VALID & stable(RESP_ID, RESP_RESP)
+  a_resp_meta     RESP_VALID -> {RESP_LEN,RESP_SIZE,RESP_ADDR_LO,RESP_BASE_CH,RESP_HEAD_PTR} == exp_meta[head]
+                  (exp_meta = SEG_LEN/SIZE/OFFSET/HEAD_PTR sampled at that slot's SEG_LAST)
+  a_reset         first cycle after reset: alloc_ptr == 0, retire_ptr == 0, occ == 0,
+                  A_ID_READY, !RESP_VALID
+  a_full_bp       full -> !A_ID_READY
+  a_refuse        A_ID_VALID & !A_ID_READY & !retire => stable(alloc_ptr)
+
+ASSERT  liveness, bounded   (d4_live task only)
+  a_resp_live     RESP_VALID waits at most 4 cycles for RESP_READY
+  a_head_live     oldest request gets RESP_VALID within
+                  (3+1) + (3+1)*MAX_PKTS cycles of becoming oldest
+  a_wait_helper a_fair_range a_age_split a_age_cmpl      helpers for the two above
+
+ASSERT  induction helpers   (DUT state == model)
+  a_occ           occ == number of live slots, occ <= ROB_DEPTH
+  a_ptr_range     alloc_ptr, retire_ptr < ROB_DEPTH
+  a_tail a_head   alloc_ptr == tail, retire_ptr == head
+  a_ring          alloc_ptr == (retire_ptr + occ) mod ROB_DEPTH
+  a_alloc_move    !admit => stable(alloc_ptr)
+  a_ret_move      !retire => stable(retire_ptr)
+  a_live[i]       live[i] == slot i within occ slots of retire_ptr
+  a_id[i]         live[i] -> ent_id[i] == exp_id[i]
+  a_err[i]        live[i] -> (ent_err[i] | ent_derr[i]) == exp_slverr[i]
+  a_inflow[i]     live[i] -> inflow_complt[i] == sealed[i]
+  a_cnt[i]        live[i] -> outflow_cnt[i] == cmpl[i]
+  a_npkts[i]      live[i] & sealed[i] -> n_pkts[i] == exp, 1 <= n_pkts[i] <= MAX_PKTS
+  a_bound[i]      live[i] -> cmpl[i] <= (sealed[i] ? n_pkts[i] : MAX_PKTS)
+  a_meta[i]       live[i] & sealed[i] -> mem_meta[i] == exp_meta[i]
+
+COVER
+  c_retire        a retire
+  c_full          ring full
+  c_slverr        retire with SLVERR
+  c_okay_max      retire OKAY with MAX_PKTS packets
+  c_wrap          retire from the last slot
+  c_early_cmpl    SEG_LAST after completions already arrived
+  c_two_split     two slots live and unsealed at once
+  c_seal_old      SEG_LAST for a slot that is not the tail
+  c_wait_max c_head_age_max   (d4_live) the liveness bounds are tight
+
+
+ADD YOURS   (plain words fine; say "check" when done)
+

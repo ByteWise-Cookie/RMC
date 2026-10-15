@@ -1,0 +1,74 @@
+rmc_cif_r_burst_spltr properties        code: rmc_cif_r_burst_spltr_fv.sv
+
+  ->   implies, same cycle          =>   implies, next cycle
+  admit  = admit_valid              pop = seg_last
+  ring   : alloc_ptr tail, pop_ptr head, wrap bit, QUEUE_DEPTH power of 2
+  ref_*  : independent re-derivation from the registered request s0 + addr_map
+  line_channel : the shared ch decode (rmc_cfg_pkg), same one the DUT uses
+
+
+ASSUME
+  m_reset_first  cycle 0: aresetn == 0
+  m_no_cross     s0_valid -> the registered burst stays inside its 4KB page
+  m_map_ch_lo    each CH source bit >= PKT_OFF_W   (a 64B line has one channel)
+  m_map_ch_hi    each CH source bit <  AXI_AW      (in range)
+  m_cfg_nch      cfg_n_ch_log2 == CH_W             (all channels active)
+
+  free: ar_valid, ar_id/addr/len/size, ar_validated, rob_free, rob_idx,
+        pkt_ready, pkt_dbuf_adr_ready, addr_map (subject to the map assumes)
+
+
+ASSERT  precompute (independent reference vs the DUT descriptor)
+  a_npkts_math   s0_valid -> n_pkts == ref_npkts (= l_last - l0 + 1)
+  a_l0           s0_valid -> l0 == ar_addr[11:6]
+  a_llast        s0_valid -> l_last == end[11:6]
+  a_admit_npkts  admit -> admit_npkts == (validated ? ref_npkts : 0)
+  a_chpkts[c]    s0_valid -> ch_pkts_eff[c] == (validated ? popcount_c : 0)
+  a_mask[c]      admit -> admit_ch_mask[c] == (ch_pkts_eff[c] != 0)
+  a_sum          admit & validated -> sum(ref_chpkts) == ref_npkts
+  a_id           admit -> admit_id == s0_id
+  a_lo           admit -> admit_addr_lo == ar_addr[11:0]
+
+ASSERT  admit handshake
+  a_admit_free    admit -> rob_free
+  a_admit_notfull admit -> !ring_full
+  a_ar_ready      ar_ready == (!s0_valid | admit)
+
+ASSERT  ring
+  a_alloc        alloc_ptr == ref alloc
+  a_pop          pop_ptr   == ref pop
+  a_no_ovf       ring_full -> !admit
+  a_alloc_mv     !admit => stable(alloc_ptr)
+  a_pop_mv       !pop   => stable(pop_ptr)
+
+ASSERT  head pop
+  a_pop_cond     pop == (!ring_empty & &ch_done[pop])
+  a_pop_rob      pop -> seg_rob_idx == q_rob[pop]
+  a_pop_live     pop -> !ring_empty
+  a_pop_order    pop -> seg_rob_idx == ref_rob[pop]      (pops in admit order)
+
+ASSERT  reset
+  a_reset        first cycle out of reset: alloc_ptr==0, pop_ptr==0,
+                 !admit, !seg_last, ar_ready, idle
+
+
+COVER
+  c_admit     admit
+  c_pop       pop
+  c_full      ring full
+  c_wrap      pop at the last ring index (wrap)
+  c_npkts_max admit with admit_npkts == MAX_PKTS
+  c_slverr    admit of a non-validated request
+  c_multich   admit whose lines spread over more than one channel
+
+
+NOT DONE
+  per-channel engine datapath: that each packet stream is exactly this channel's
+    lines, in order, into contiguous RD-SRAM slots (head_ptr + m). Checked here
+    only at the protocol level (ch_done gating of the pop). A dedicated engine
+    harness (rmc_cif_r_burst_spltr_ch top) is the natural place for it.
+  liveness: every admitted request eventually pops. Needs a fairness assumption
+    on pkt_ready / pkt_dbuf_adr_ready (bounded-liveness, like rob d4_live).
+
+
+ADD YOURS   (same style or plain words, one per line)

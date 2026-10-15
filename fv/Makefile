@@ -1,10 +1,10 @@
 # Formal verification runs (SymbiYosys).
 #   make            run every task of every module
-#   make rob        run every task of rmc_cif_rob
-#   make robtest    read + write ROB pair (tb/tests/module_level/rob)
-#   make rob T=d4_prove   run one task
-#   make traces M=rob T=d4_cover          list which trace shows which property
-#   make wave   M=rob T=d4_cover N=4      open trace4.vcd in gtkwave
+#   make rrob       run every task of rmc_cif_rrob (read ROB)
+#   make rspltr     run every task of rmc_cif_r_burst_spltr
+#   make rrob T=d4_prove   run one task
+#   make traces M=rrob T=d4_cover          list which trace shows which property
+#   make wave   M=rrob T=d4_cover N=4      open trace4.vcd in gtkwave
 #   make clean
 #
 # Tools come from OSS CAD Suite; override OSS_CAD if it lives elsewhere.
@@ -15,11 +15,11 @@ export PATH := $(OSS_CAD)/bin:$(PATH)
 WORK := work
 
 # short name -> .sby file
-SBY_rob := cif/rmc_cif_rob/rmc_cif_rob.sby
-SBY_robtest := cif/rmc_cif_rob/rob_test.sby
+SBY_rrob := cif/rmc_cif_rrob/rmc_cif_rrob.sby
+SBY_rspltr := cif/rmc_cif_r_burst_spltr/rmc_cif_r_burst_spltr.sby
 SBY_tut := tutorial/tut_cnt.sby
 
-MODULES := rob robtest tut
+MODULES := rrob rspltr tut
 
 .PHONY: all $(MODULES) traces wave clean
 # tut is a teaching example with an expected failure; run it by name
