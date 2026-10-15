@@ -22,10 +22,11 @@ module rmc_cif #(
   // (matched BW, inflow==outflow). Imported below; do not override per-instance.
   // reorder buffer / packetization
   parameter int ROB_DEPTH = 32,        // physical ROB entries (16-32)   [root knob]
-  parameter int MAX_PKTS  = 16,        // packets per request (<=16-beat) [root knob]
+  parameter int MAX_PKTS  = MAX_REQ_PKTS, // lines per request: 4KB / 64B = 64 [root knob]
   // data buffers (client-side ports; SRAM may be instanced at MC top)
   parameter int N_WDB     = 32,        // WD_SRAM slots
-  parameter int N_RDB     = 32,        // RD_SRAM slots
+  parameter int N_RDB     = 64,        // RD_SRAM slots per channel (>= MAX_PKTS: one request
+                                       // can land all its lines on one channel)
 
   // derived widths (localparam: not overridable, visible to port list)
   localparam int SRAM_W    = PKT_BYTES * 8,   // one 64B packet per line (= BL*DQ_W)
@@ -185,13 +186,11 @@ module rmc_cif #(
   logic [AXI_IDW-1:0]     ar_admit_id;
   logic                   ar_admit_validated;
   logic [CNT_W-1:0]       ar_admit_npkts;
-  logic [11:0]            ar_admit_addr_lo;      // ar_addr[11:0]
-  logic [PKT_OFF_W-1:0]   ar_admit_offset;       // = ar_addr[5:0]
+  logic [PAGE_LSB-1:0]    ar_admit_addr_lo;      // ar_addr[PAGE_LSB-1:0]: [5:0] trim, [11:6] l0
   logic [R_LEN_W-1:0]     ar_admit_len;
   logic [R_SIZE_W-1:0]    ar_admit_size;
   logic [CH_W-1:0]        ar_admit_base_ch;
   logic [N_CH-1:0]        ar_admit_ch_mask;
-  assign ar_admit_offset = ar_admit_addr_lo[PKT_OFF_W-1:0];
 
   // read burst splitter. Owns the AR handshake (arready); the ROB only offers a free slot
   // (rob_free/rob_idx) and allocates on admit_valid. TODO: pkt_* -> the per-channel req async
@@ -271,7 +270,7 @@ module rmc_cif #(
     .cmpl_rob_index (async_mc_cmpl_rob_index),
     .AW_REQUEST     ({ar_admit_id, ar_admit_validated}),
     .ADMIT_NPKTS    (ar_admit_npkts),
-    .ADMIT_OFFSET   (ar_admit_offset),
+    .ADMIT_ADDR_LO  (ar_admit_addr_lo),
     .ADMIT_LEN      (8'(ar_admit_len)),
     .ADMIT_SIZE     (3'(ar_admit_size)),
     .ADMIT_BASE_CH  (ar_admit_base_ch),

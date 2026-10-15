@@ -18,12 +18,13 @@
 // the split done and delivers the resp meta.
 //
 // One request:
-//   admit    : write {id, err, n_pkts} at alloc_ptr, clear outflow, advance alloc_ptr
+//   admit    : write {id, err, n_pkts, len, size, addr_lo, base_ch} at alloc_ptr, clear
+//              outflow, advance alloc_ptr. addr_lo + base_ch are the resp channel-walk seed.
 //   handoff  : rseg captures ROB_IDX (= alloc_ptr) on admit; it rides the request
-//   SEG_LAST : inflow_complt[SEG_ROB_IDX]=1, mem_meta <= {len,size,offset,head}
+//   SEG_LAST : inflow_complt[SEG_ROB_IDX]=1, mem_head[SEG_ROB_IDX] <= per-channel head slots
 //   cmpl     : outflow_cnt[rob_index]++ ; cmpl_err tags a downstream error
-//   retire   : when inflow_complt && outflow_cnt==n_pkts, drive RESP_* (id, resp, and
-//              the read meta head_ptr/offset/len/size for the resp-path trim), pop slot
+//   retire   : when inflow_complt && outflow_cnt==n_pkts, drive RESP_* (id, resp, and the read
+//              meta head_ptr/addr_lo/base_ch/len/size for the resp-path rebuild+trim), pop slot
 //
 // Completion is a pulse {rob_index, err}; the ROB counts pulses, no packet number.
 
@@ -41,8 +42,8 @@ module rmc_cif_rrob #(
   localparam int CNT_W      = (MAX_PKTS  > 1) ? $clog2(MAX_PKTS+1) : 1, // packet-count width
   localparam int REQ_META_W = AXI_IDW + 1,                    // admit payload {id, validated}
   localparam int SLOT_PTR_W = (N_SLOTS > 1) ? $clog2(N_SLOTS) : 1, // RD-SRAM head-slot width
-  localparam int META_W     = 8 + 3 + PKT_OFF_W + CH_W + N_CH*SLOT_PTR_W
-                              // resp meta {len8, size3, offset, base_ch, head[N_CH]}
+  localparam int META_W     = 8 + 3 + PAGE_LSB + CH_W + N_CH*SLOT_PTR_W
+                              // resp meta {len8, size3, addr_lo, base_ch, head[N_CH]}
 )(
   input  logic                   aclk,
   input  logic                   aresetn,
@@ -59,10 +60,16 @@ module rmc_cif_rrob #(
   // per-channel head pointers are still unknown here - they arrive at SEG_LAST.
   input  logic [REQ_META_W-1:0]  AW_REQUEST,       // {A_ID, A_VALIDATED}
   input  logic [CNT_W-1:0]       ADMIT_NPKTS,      // total packets for this request (at admit)
-  input  logic [PKT_OFF_W-1:0]   ADMIT_OFFSET,     // unaligned start offset  (resp trim)
+  input  logic [PAGE_LSB-1:0]    ADMIT_ADDR_LO,    // ar_addr[PAGE_LSB-1:0]: [PKT_OFF_W-1:0] = trim
+                                                   //   offset, [PAGE_LSB-1:PKT_OFF_W] = start line l0.
+                                                   //   The resp rebuild walks this per line to re-derive
+                                                   //   the channel of each line (see base_ch below).
   input  logic [7:0]             ADMIT_LEN,        // ar_len  (beats-1)       (resp trim)
   input  logic [2:0]             ADMIT_SIZE,       // ar_size (log2 beat bytes)(resp trim)
-  input  logic [CH_W-1:0]        ADMIT_BASE_CH,    // start channel (line 0) for the resp walk
+  input  logic [CH_W-1:0]        ADMIT_BASE_CH,    // channel of line 0. Freezes the CH source bits that
+                                                   //   sit >= PAGE_LSB (constant across the request, so
+                                                   //   absent from ADDR_LO); the rebuild takes those
+                                                   //   bits from here and the in-page ones from ADDR_LO.
   input  logic                   A_ID_VALID,
   output logic                   A_ID_READY,       // free slot
 
@@ -83,8 +90,9 @@ module rmc_cif_rrob #(
   output logic [AXI_IDW-1:0]     RESP_ID,
   output logic [1:0]             RESP_RESP,        // 00 OKAY / 10 SLVERR
   output logic [N_CH-1:0][SLOT_PTR_W-1:0] RESP_HEAD_PTR, // per-channel RD-SRAM head slots
-  output logic [CH_W-1:0]        RESP_BASE_CH,     // start channel (orders the read walk)
-  output logic [PKT_OFF_W-1:0]   RESP_OFFSET,      // start byte offset (pre/post trim)
+  output logic [CH_W-1:0]        RESP_BASE_CH,     // channel of line 0 (frozen out-of-page CH bits)
+  output logic [PAGE_LSB-1:0]    RESP_ADDR_LO,     // ar_addr[PAGE_LSB-1:0]: [PKT_OFF_W-1:0] trim offset,
+                                                   //   [PAGE_LSB-1:PKT_OFF_W] start line (channel walk)
   output logic [7:0]             RESP_LEN,         // ar_len
   output logic [2:0]             RESP_SIZE         // ar_size
 );
@@ -129,18 +137,18 @@ module rmc_cif_rrob #(
   wire retire_fire  = RESP_VALID & RESP_READY;  // oldest entry pops this cycle
 
   // resp meta, read out at retire for the resp-path trim. Split by when it is known:
-  //   mem_adm  {len, size, offset, base_ch} - written at ADMIT (all known then)
+  //   mem_adm  {len, size, addr_lo, base_ch} - written at ADMIT (all known then)
   //   mem_head per-channel RD-SRAM head slots - written at SEG_LAST (filled by the engines)
   logic [7:0]                      madm_len  [ROB_DEPTH];
   logic [2:0]                      madm_size [ROB_DEPTH];
-  logic [PKT_OFF_W-1:0]            madm_off  [ROB_DEPTH];
+  logic [PAGE_LSB-1:0]             madm_alo  [ROB_DEPTH];
   logic [CH_W-1:0]                 madm_bch  [ROB_DEPTH];
   logic [N_CH-1:0][SLOT_PTR_W-1:0] mem_head  [ROB_DEPTH];
   always_ff @(posedge aclk)
     if (SEG_LAST) mem_head[SEG_ROB_IDX] <= SEG_HEAD_PTR;
   assign RESP_LEN      = madm_len [retire_ptr];
   assign RESP_SIZE     = madm_size[retire_ptr];
-  assign RESP_OFFSET   = madm_off [retire_ptr];
+  assign RESP_ADDR_LO  = madm_alo [retire_ptr];
   assign RESP_BASE_CH  = madm_bch [retire_ptr];
   assign RESP_HEAD_PTR = mem_head [retire_ptr];
 
@@ -161,7 +169,7 @@ module rmc_cif_rrob #(
         n_pkts[alloc_ptr]        <= ADMIT_NPKTS;
         madm_len[alloc_ptr]      <= ADMIT_LEN;
         madm_size[alloc_ptr]     <= ADMIT_SIZE;
-        madm_off[alloc_ptr]      <= ADMIT_OFFSET;
+        madm_alo[alloc_ptr]      <= ADMIT_ADDR_LO;
         madm_bch[alloc_ptr]      <= ADMIT_BASE_CH;
         alloc_ptr <= (alloc_ptr == PTR_W'(ROB_DEPTH-1)) ? '0 : alloc_ptr + 1'b1;
       end

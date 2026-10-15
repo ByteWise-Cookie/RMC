@@ -61,9 +61,18 @@ package rmc_cfg_pkg;
 
   // ---- packet / channel geometry ----
   parameter int PKT_BYTES = BL * DQ_W / 8;              // 64 B (BL16 x 32b subchannel)
-  parameter int PKT_OFF_W = $clog2(PKT_BYTES);          // 6
+  parameter int PKT_OFF_W = $clog2(PKT_BYTES);          // 6  (byte-in-line, = LINE_LSB)
   parameter int N_CH      = 2;                           // channels (1 MC core each)
   parameter int CH_W      = (N_CH > 1) ? $clog2(N_CH) : 1;
+
+  // Smallest page the AXI map guarantees (JESD: 4 KB). An INCR burst never crosses it,
+  // so within one request only the in-page line bits [PAGE_LSB-1:PKT_OFF_W] vary; every
+  // address bit >= PAGE_LSB is constant for the whole request. The read response rebuild
+  // relies on this: it stores ar_addr[PAGE_LSB-1:0] (the varying part) and recovers the
+  // out-of-page channel bits from base_ch (which freezes them). Single source for the
+  // splitter and the read ROB.
+  parameter int PAGE_LSB  = 12;                          // log2(4 KB)
+  parameter int PG_LINES  = 1 << (PAGE_LSB - PKT_OFF_W); // lines per page (64)
 
   // ---- matched-bandwidth AXI width ----
   // AXI_DW = N_DDR_CHANNELS * DDR_CHANNEL_WIDTH so the ingress (AXI write) rate
