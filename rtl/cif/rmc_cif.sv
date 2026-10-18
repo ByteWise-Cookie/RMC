@@ -101,10 +101,12 @@ module rmc_cif #(
   output logic [$clog2(N_WDB)-1:0] wdb_addr,
   output logic [SRAM_W-1:0]        wdb_din,
 
-  // RD_SRAM client-side read port (MC writes; CIF drains to R)
-  output logic                     rdb_re,
-  output logic [$clog2(N_RDB)-1:0] rdb_addr,
-  input  logic [SRAM_W-1:0]        rdb_dout
+  // RD_SRAM client-side read port, one per channel (MC writes; CIF drains to R).
+  // Per-channel: each read engine owns its channel's RD-SRAM, and r_resp reads the
+  // channel a line maps to. Parent must provide N_CH read ports.
+  output logic [N_CH-1:0]                    rdb_re,
+  output logic [N_CH-1:0][$clog2(N_RDB)-1:0] rdb_addr,
+  input  logic [N_CH-1:0][SRAM_W-1:0]        rdb_dout
 );
 
   // nets between sub-blocks (TODO: size/name as logic fills in)
@@ -162,7 +164,8 @@ module rmc_cif #(
   //     packed per-channel index - open; affects RD-SRAM size + resp readback.
   //   - scattered-map fallback: rseg assumes the contract map (ch = low CH_W
   //     line bits); an arbitrary CSR map needs the scan path (not built).
-  //   - RESP_* from u_rrob -> the R response channel (drain RD-SRAM, trim).
+  // RESP_* -> R channel is now wired through u_r_resp (per-channel RD-SRAM read,
+  // window-mux channel recovery, full-width INCR; narrow-burst trim still TODO).
   // ====================================================================
 
   // read splitter <-> read ROB handoff nets. Splitter-side widths for ar_len/ar_size and
@@ -179,6 +182,16 @@ module rmc_cif #(
   logic                        ar_seg_last;     // a read request finished splitting
   logic [ROB_IDX_W-1:0]        ar_seg_rob_idx;  // which entry it closes
   logic [N_CH-1:0][SLOT_W-1:0] ar_seg_head_ptr; // per-channel RD-SRAM head slots (at seg_last)
+
+  // read ROB retire -> read-response assembler (RESP_* descriptor)
+  logic                               rsp_valid, rsp_ready;
+  logic [AXI_IDW-1:0]                 rsp_id;
+  logic [1:0]                         rsp_resp;
+  logic [N_CH-1:0][$clog2(N_RDB)-1:0] rsp_head_ptr;
+  logic [CH_W-1:0]                    rsp_base_ch;
+  logic [PAGE_LSB-1:0]                rsp_addr_lo;
+  logic [7:0]                         rsp_len;
+  logic [2:0]                         rsp_size;
 
   // admit descriptor from the splitter. All known at admit, so it ships to the ROB early:
   // completions that beat the split still count, and the resp trim meta is ready up front.
@@ -279,8 +292,47 @@ module rmc_cif #(
     .ROB_IDX        (ar_rob_idx),
     .SEG_LAST       (ar_seg_last),
     .SEG_ROB_IDX    (ar_seg_rob_idx),
-    .SEG_HEAD_PTR   (ar_seg_head_ptr)
-    // TODO: RESP_* -> R response path
+    .SEG_HEAD_PTR   (ar_seg_head_ptr),
+    .RESP_VALID     (rsp_valid),
+    .RESP_READY     (rsp_ready),
+    .RESP_ID        (rsp_id),
+    .RESP_RESP      (rsp_resp),
+    .RESP_HEAD_PTR  (rsp_head_ptr),
+    .RESP_BASE_CH   (rsp_base_ch),
+    .RESP_ADDR_LO   (rsp_addr_lo),
+    .RESP_LEN       (rsp_len),
+    .RESP_SIZE      (rsp_size)
+  );
+
+  // read-response assembler: drains the per-channel RD-SRAM into the R channel for one
+  // retired request at a time, in ascending address order (recovers each line's channel
+  // from the RESP descriptor via the window mux).
+  rmc_cif_r_resp #(
+    .AXI_IDW (AXI_IDW),
+    .N_RDB   (N_RDB)
+  ) u_r_resp (
+    .aclk          (aclk),
+    .aresetn       (aresetn),
+    .addr_map      (addr_map),
+    .cfg_n_ch_log2 (R_NCH_LOG_W'(CH_W)),      // all channels active (boot CSR; constant now)
+    .resp_valid    (rsp_valid),
+    .resp_ready    (rsp_ready),
+    .resp_id       (rsp_id),
+    .resp_resp     (rsp_resp),
+    .resp_head_ptr (rsp_head_ptr),
+    .resp_base_ch  (rsp_base_ch),
+    .resp_addr_lo  (rsp_addr_lo),
+    .resp_len      (rsp_len),
+    .resp_size     (rsp_size),
+    .rdb_re        (rdb_re),
+    .rdb_addr      (rdb_addr),
+    .rdb_dout      (rdb_dout),
+    .rid           (rid),
+    .rdata         (rdata),
+    .rresp         (rresp),
+    .rlast         (rlast),
+    .rvalid        (rvalid),
+    .rready        (rready)
   );
 
   // write ROB. admit direct from AW channel + validator (AW_req buffer not built yet).
@@ -309,20 +361,14 @@ module rmc_cif #(
   assign async_mc_req_sram_slot   = '0;
 
   // awready / arready are driven by the ROBs' A_ID_READY (admit backpressure).
+  // R channel + rdb_* are now driven by u_r_resp.
   assign wready  = 1'b0;
   assign bid     = '0;
   assign bresp   = 2'b00;
   assign bvalid  = 1'b0;
-  assign rid     = '0;
-  assign rdata   = '0;
-  assign rresp   = 2'b00;
-  assign rlast   = 1'b0;
-  assign rvalid  = 1'b0;
 
   assign wdb_we   = 1'b0;
   assign wdb_addr = '0;
   assign wdb_din  = '0;
-  assign rdb_re   = 1'b0;
-  assign rdb_addr = '0;
 
 endmodule : rmc_cif
