@@ -65,12 +65,12 @@ module rmc_cif_r_burst_spltr_fv #(
   input logic                              idle,
 
   // DUT internals (reachable through the bind)
-  input logic                              s0_valid,
-  input logic [AXI_IDW-1:0]                s0_id,
-  input logic [AXI_AW-1:0]                 s0_addr,
-  input logic [LEN_W-1:0]                  s0_len,
-  input logic [SIZE_W-1:0]                 s0_size,
-  input logic                              s0_validated,
+  input logic                              s1_valid,
+  input logic [AXI_IDW-1:0]                s1_id,
+  input logic [AXI_AW-1:0]                 s1_addr,
+  input logic [LEN_W-1:0]                  s1_len,
+  input logic [SIZE_W-1:0]                 s1_size,
+  input logic                              s1_validated,
   input logic [CNT_W-1:0]                  n_pkts,
   input logic [N_CH-1:0][CNT_W-1:0]        ch_pkts_eff,
   input logic [LN_W-1:0]                   l0,
@@ -130,22 +130,22 @@ module rmc_cif_r_burst_spltr_fv #(
                 & (fv_alloc[QIDX_W] != fv_pop[QIDX_W]);
 
   // ------------------------------------------------------------------------
-  // 2. independent precompute reference (from s0, compared to the DUT descriptor)
+  // 2. independent precompute reference (from s1, compared to the DUT descriptor)
   // ------------------------------------------------------------------------
   logic [PAGE_LSB-1:0] ref_amask, ref_aal;
   logic [15:0]         ref_nbytes, ref_end;
   logic [CNT_W-1:0]    ref_npkts;
-  assign ref_amask  = PAGE_LSB'((32'd1 << s0_size) - 32'd1);
-  assign ref_aal    = s0_addr[PAGE_LSB-1:0] & ~ref_amask;
-  assign ref_nbytes = (16'(s0_len) + 16'd1) << s0_size;
+  assign ref_amask  = PAGE_LSB'((32'd1 << s1_size) - 32'd1);
+  assign ref_aal    = s1_addr[PAGE_LSB-1:0] & ~ref_amask;
+  assign ref_nbytes = (16'(s1_len) + 16'd1) << s1_size;
   assign ref_end    = 16'(ref_aal) + ref_nbytes - 16'd1;
-  wire [LN_W-1:0] ref_l0_b    = s0_addr[PAGE_LSB-1 -: LN_W];      // ar_addr[11:6]
+  wire [LN_W-1:0] ref_l0_b    = s1_addr[PAGE_LSB-1 -: LN_W];      // ar_addr[11:6]
   wire [LN_W-1:0] ref_llast_b = ref_end [PAGE_LSB-1 -: LN_W];     // end[11:6]
   assign ref_npkts = CNT_W'(ref_llast_b) - CNT_W'(ref_l0_b) + CNT_W'(1);
 
   // independent per-channel popcount over the page lines
   function automatic logic [AXI_AW-1:0] ref_line_byte(input logic [LN_W-1:0] i);
-    ref_line_byte = {s0_addr[AXI_AW-1:PAGE_LSB], i, {LN_W{1'b0}}};
+    ref_line_byte = {s1_addr[AXI_AW-1:PAGE_LSB], i, {LN_W{1'b0}}};
   endfunction
   logic [N_CH_L-1:0][CNT_W-1:0] ref_chpkts;
   always_comb begin
@@ -163,12 +163,12 @@ module rmc_cif_r_burst_spltr_fv #(
   always_ff @(posedge aclk) fv_started <= 1'b1;
   `ASSUME(m_reset_first, fv_started || !aresetn);
   // the registered request, when it is going to admit, stays inside its 4KB page
-  `ASSUME(m_no_cross, !s0_valid || (ref_end[15:PAGE_LSB] == '0));
+  `ASSUME(m_no_cross, !s1_valid || (ref_end[15:PAGE_LSB] == '0));
   // AXI: a beat is never wider than the data bus
-  `ASSUME(m_req_size, !s0_valid || (32'(1) << s0_size) <= AXI_DW / 8);
+  `ASSUME(m_req_size, !s1_valid || (32'(1) << s1_size) <= AXI_DW / 8);
   // the request fits the packet counter. Automatic at MAX_PKTS = 64 (a 4KB page holds 64
   // lines); the small proof configs use a smaller MAX_PKTS and need it stated.
-  `ASSUME(m_req_fits, !s0_valid || 32'(ref_llast_b) - 32'(ref_l0_b) + 1 <= MAX_PKTS);
+  `ASSUME(m_req_fits, !s1_valid || 32'(ref_llast_b) - 32'(ref_l0_b) + 1 <= MAX_PKTS);
 
   // legal map: each CH source bit sits at or above the line offset (so a 64B line has one
   // channel) and inside the address, and only the active channels are selected. A CSR can
@@ -185,13 +185,13 @@ module rmc_cif_r_burst_spltr_fv #(
   // 3. assertions
   // ------------------------------------------------------------------------
   // precompute vs DUT
-  `ASSERT(a_npkts_math, !s0_valid || n_pkts == ref_npkts);
-  `ASSERT(a_l0,         !s0_valid || l0 == ref_l0_b);
-  `ASSERT(a_llast,      !s0_valid || l_last == ref_llast_b);
-  `ASSERT(a_admit_npkts, !admit || admit_npkts == (s0_validated ? ref_npkts : CNT_W'(0)));
+  `ASSERT(a_npkts_math, !s1_valid || n_pkts == ref_npkts);
+  `ASSERT(a_l0,         !s1_valid || l0 == ref_l0_b);
+  `ASSERT(a_llast,      !s1_valid || l_last == ref_llast_b);
+  `ASSERT(a_admit_npkts, !admit || admit_npkts == (s1_validated ? ref_npkts : CNT_W'(0)));
   for (genvar c = 0; c < N_CH_L; c++) begin : g_ch
-    `ASSERT(a_chpkts, !s0_valid ||
-            ch_pkts_eff[c] == (s0_validated ? ref_chpkts[c] : CNT_W'(0)));
+    `ASSERT(a_chpkts, !s1_valid ||
+            ch_pkts_eff[c] == (s1_validated ? ref_chpkts[c] : CNT_W'(0)));
     `ASSERT(a_mask,   !admit || admit_ch_mask[c] == (ch_pkts_eff[c] != CNT_W'(0)));
   end
   // sum of per-channel counts equals the total (completeness of the split)
@@ -200,14 +200,14 @@ module rmc_cif_r_burst_spltr_fv #(
     ref_sum = '0;
     for (int c = 0; c < N_CH_L; c++) ref_sum = ref_sum + (CNT_W+CH_W+1)'(ref_chpkts[c]);
   end
-  `ASSERT(a_sum, !admit || !s0_validated || ref_sum == (CNT_W+CH_W+1)'(ref_npkts));
-  `ASSERT(a_id,  !admit || admit_id == s0_id);
-  `ASSERT(a_lo,  !admit || admit_addr_lo == s0_addr[PAGE_LSB-1:0]);
+  `ASSERT(a_sum, !admit || !s1_validated || ref_sum == (CNT_W+CH_W+1)'(ref_npkts));
+  `ASSERT(a_id,  !admit || admit_id == s1_id);
+  `ASSERT(a_lo,  !admit || admit_addr_lo == s1_addr[PAGE_LSB-1:0]);
 
   // admit handshake
   `ASSERT(a_admit_free,    !admit || rob_free);                 // only with a ROB slot
   `ASSERT(a_admit_notfull, !admit || !fv_full);                 // and queue room
-  `ASSERT(a_ar_ready,      ar_ready == (~s0_valid | admit));    // AR backpressure
+  `ASSERT(a_ar_ready,      ar_ready == (~s1_valid | admit));    // AR backpressure
 
   // ring tracking
   `ASSERT(a_alloc,     alloc_ptr == fv_alloc);
@@ -298,12 +298,12 @@ module rmc_cif_r_burst_spltr_fv #(
       if (w_enq) begin
         w_live  <= 1'b1;
         w_ptr   <= fv_alloc;
-        w_page  <= s0_addr[AXI_AW-1:PAGE_LSB];
+        w_page  <= s1_addr[AXI_AW-1:PAGE_LSB];
         w_l0    <= ref_l0_b;
         w_llast <= ref_llast_b;
         w_rob   <= rob_idx;
-        w_val   <= s0_validated;
-        for (int c = 0; c < N_CH; c++) w_cnt[c] <= s0_validated ? ref_chpkts[c] : '0;
+        w_val   <= s1_validated;
+        for (int c = 0; c < N_CH; c++) w_cnt[c] <= s1_validated ? ref_chpkts[c] : '0;
       end
     end
   end
