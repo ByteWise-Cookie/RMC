@@ -1,0 +1,71 @@
+rmc_cif_r_resp properties        code: rmc_cif_r_resp_fv.sv
+
+  ->  implies, same cycle         =>  implies, next cycle
+  beat = rvalid & rready          last beat = rvalid & rlast & rready
+  g_fire = a beat issued in G     run = a request is being streamed
+  ref_* = independent model (closed-form address + per-channel line counters)
+
+  The window-mux channel recovery (walk_channel) is NOT re-proved here - the splitter
+  FV already proves the window mux equals the full-address decode. This harness proves
+  the WALK r_resp adds: address stepping (any ar_size), per-channel slot counting, and
+  the R handshake. ref_chan is that same (proven) channel function, used as the oracle.
+
+
+ASSUME
+  m_reset_first   cycle 0: aresetn == 0
+  m_size_legal    ar_size <= full bus width (log2(AXI_DW/8))
+  m_map_ch_lo/hi  each CH source bit sits at/above the 64B line offset and in-address
+  m_cfg_nch       cfg_n_ch_log2 == CH_W (all channels active)
+  m_map_stable    addr_map constant while requests are in flight (boot CSR)
+  m_desc_stable   ROB holds the descriptor stable while resp_valid & !resp_ready
+  m_in_page       the aligned burst span stays inside its 4 KB page
+
+  free: resp_valid, resp_* descriptor, rready, rdb_dout (SRAM data), cmpl order
+
+
+ASSERT  walk (DUT counters == independent closed-form walk)
+  a_beat    beat_q == ref beat index
+  a_line    line_q == ref line index (aligned addr_lo + beat*2^size)[11:6]
+  a_off     off_q  == ref in-line byte offset (stepped by 2^size)
+  a_size    size_q == latched ar_size
+  a_chunk   chunk  == off_q[PKT_OFF_W-1:BEAT_LSB]
+
+ASSERT  slot (reorder to address order)
+  a_cnt[c]  cnt_q[c] == ref per-channel line count
+  a_ch      ch == ref_chan(line_q)                 DUT channel == oracle
+  a_slot    slot == head_ptr[ch] + cnt_q[ch]
+  a_rd_onehot  g_fire & !err -> rdb_re one-hot at ch
+  a_rd_addr    g_fire & !err -> rdb_addr[ch] == slot
+  a_slot_rng   g_fire & !err -> slot < N_RDB
+
+ASSERT  R-channel handshake + metadata
+  a_rvalid   rvalid == d_valid
+  a_rid      rvalid -> rid == latched id
+  a_rresp    rvalid -> rresp == (err ? SLVERR : OKAY)
+  a_rlast    rlast  == d_valid & d_last
+  a_last     is_last == (beat_q == len_q)
+  a_resprdy  resp_ready == d_valid & d_last & rready     (pop/free on last accepted)
+  a_hold     rvalid & !rready => rvalid & stable(rid, rresp, rlast)   (data excluded)
+  a_release  last accepted => request releases (run drops)
+  a_gfire    g_fire only while run & !g_last_done
+  a_reset    first cycle after reset: !run, !rvalid, !resp_ready
+
+
+COVER
+  c_beat     a beat is accepted
+  c_last     the final beat is accepted (rlast)
+  c_stall    rvalid held with rready low
+  c_cross    a 64 B line boundary is crossed
+  c_narrow   a narrow burst (ar_size < full) is in flight
+  c_two_ch   both channels used in one request
+  c_slverr   an SLVERR beat
+
+
+NOTES
+  - RD-SRAM data (rdb_dout) is a free input; the harness checks the READ ADDRESS
+    (ch, slot, chunk) is correct, not the byte values (SRAM content is external).
+  - lint-elaborated with verilator --assert (exit 0); run the proof with the OSS
+    CAD suite: make rresp [T=s_prove|s_cover|s_bmc|full_prove].
+
+
+ADD YOURS   (plain words fine; say "check" when done)
