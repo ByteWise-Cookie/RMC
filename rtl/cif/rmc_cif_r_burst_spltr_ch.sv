@@ -194,9 +194,7 @@ module rmc_cif_r_burst_spltr_ch #(
 
 endmodule : rmc_cif_r_burst_spltr_ch
 
-// ============================================================================
 // THEORY OF OPERATION   (one channel engine; read with rmc_cif_r_burst_spltr.sv)
-// ============================================================================
 //
 // ONE LINE
 //   Walk the shared queue; for each entry, either SKIP it (no lines for me) or
@@ -269,4 +267,3 @@ endmodule : rmc_cif_r_burst_spltr_ch
 //        in different stages. pkt_valid/dbuf handshake must then pipeline with it.
 //   Note the skip path MUST stay single-cycle and unconditional (head-pop safety);
 //   pipeline the ISSUE datapath, not the rd_ptr advance rate for skips.
-// ============================================================================

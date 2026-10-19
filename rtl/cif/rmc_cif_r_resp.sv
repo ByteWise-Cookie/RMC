@@ -228,7 +228,7 @@ module rmc_cif_r_resp #(
       g_last_done <= 1'b0;
       d_valid     <= 1'b0;
     end else begin
-      // ---- D stage: accept a new beat from G, or drain the held one
+      // D stage: accept a new beat from G, or drain the held one
       if (d_ready) begin
         d_valid <= g_fire;
         if (g_fire) begin
@@ -241,7 +241,7 @@ module rmc_cif_r_resp #(
         end
       end
 
-      // ---- G stage: advance the walk on each issued beat
+      // G stage: advance the walk on each issued beat
       if (g_fire) begin
         if (is_last) begin
           g_last_done <= 1'b1;                            // stop issuing; wait for D to drain
@@ -255,7 +255,7 @@ module rmc_cif_r_resp #(
         end
       end
 
-      // ---- request boundary
+      // request boundary
       if (resp_ready) begin
         run         <= 1'b0;                             // last beat accepted; ROB popped, slots freed
         g_last_done <= 1'b0;

@@ -152,7 +152,6 @@ module rmc_cif #(
   rmc_cif_reqvalidator #(.AXI_AW(AXI_AW)) u_val_ar (
     .req_addr (araddr), .req_len (arlen), .req_size (arsize), .req_ok (ar_ok));
 
-  // ====================================================================
   // READ PATH LEFT TO DO (rseg/rrob control is wired; these remain):
   //   - req_dbuf_base: the RD-SRAM slot allocator is not built; u_rseg's
   //     req_dbuf_base is stubbed. Allocate a contiguous RD-SRAM base per
@@ -166,7 +165,6 @@ module rmc_cif #(
   //     line bits); an arbitrary CSR map needs the scan path (not built).
   // RESP_* -> R channel is now wired through u_r_resp (per-channel RD-SRAM read,
   // window-mux channel recovery, full-width INCR; narrow-burst trim still TODO).
-  // ====================================================================
 
   // read splitter <-> read ROB handoff nets. Splitter-side widths for ar_len/ar_size and
   // cfg_n_ch_log2 (mirror the splitter's own derivation so the port connections match).

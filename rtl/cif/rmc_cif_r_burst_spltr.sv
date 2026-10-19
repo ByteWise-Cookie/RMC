@@ -126,7 +126,6 @@ module rmc_cif_r_burst_spltr #(
   output logic                           idle               // queue empty, all engines idle
 );
 
-  // ==========================================================================
   // One-register / two-segment precompute pipeline feeding the admit+enqueue
   // commit. Sized for an AXI-fabric clock (~1.2 GHz): the whole precompute is
   // ~24 logic levels, so one cut leaves ~12 per segment, comfortably inside the
@@ -141,7 +140,6 @@ module rmc_cif_r_burst_spltr #(
   // while it drains; a full ROB/queue stalls the chain from the commit back.
   // If STA shows stage 2 heavy, nudge base_ch or n_pkts into stage 1, or add a
   // second register - do not pre-split before the tool says so.
-  // ==========================================================================
 
   // queue ring pointers (declared early; the commit needs q_full)
   logic [QPTR_W-1:0]  alloc_ptr, pop_ptr;
@@ -360,9 +358,7 @@ module rmc_cif_r_burst_spltr #(
 
 endmodule : rmc_cif_r_burst_spltr
 
-// ============================================================================
 // THEORY OF OPERATION   (read together with rmc_cif_r_burst_spltr_ch.sv)
-// ============================================================================
 //
 // ONE LINE
 //   One AXI read request -> a run of 64B line packets, each routed to the DRAM
@@ -496,4 +492,3 @@ endmodule : rmc_cif_r_burst_spltr
 //   subtotals. Do not pre-split before the tool asks - at 1.2 GHz this is plenty.
 //   The engines (see ch file) have their own, separate critical path - the
 //   precompute pipeline does not touch them.
-// ============================================================================
