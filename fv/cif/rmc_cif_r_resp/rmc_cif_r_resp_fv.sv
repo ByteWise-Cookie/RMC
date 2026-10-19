@@ -12,10 +12,10 @@
 //   3. handshake : rvalid holds until rready; rid/rresp/rlast are correct and stable under
 //                  back-pressure; resp_ready pulses exactly on the last accepted beat; the
 //                  request then releases.
-// The channel reconstruction (walk_channel, the window mux) is NOT re-proved here - the
-// splitter FV already proves the window mux equals the full-address decode (a_rebuild).
-// This checker uses that same channel function as the oracle for the counting/stepping
-// logic, which is what r_resp adds.
+// The channel reconstruction is NOT re-proved here - the splitter FV proves the
+// descriptor rebuild equals the full-address decode (a_rebuild). It is the oracle here.
+// Every other answer (address of beat b, slot of a line, which beat is on R) comes from a
+// closed form on the latched request, not from a copy of the DUT's counters.
 //
 // Property style matches the other cif harnesses: boolean only (no |->, |=>, sequences).
 //   a -> b  written  !a || b ;  a => b  written via `NEXT (skips first post-reset cycle).
@@ -92,20 +92,6 @@ module rmc_cif_r_resp_fv #(
 
   localparam int N_CH_L = 1 << CH_W;
 
-  // channel of a page line, rebuilt from the descriptor (the window mux the DUT uses). Same
-  // function as walk_channel; used here only as the oracle for the counting/stepping logic.
-  function automatic logic [CH_W-1:0] ref_chan(input logic [LINE_W-1:0] ln);
-    logic [PAGE_LSB-1:0] tag;
-    int src;
-    tag = {ln, {OFF_W{1'b0}}};
-    ref_chan = '0;
-    for (int k = 0; k < CH_W; k++)
-      if (k < int'(cfg_n_ch_log2)) begin
-        src = int'(addr_map[OFF_W + k]);
-        ref_chan[k] = (src < PAGE_LSB) ? tag[(src < PAGE_LSB) ? src : 0] : bch_q[k];
-      end
-  endfunction
-
   // assumptions
   logic started = 1'b0;
   always_ff @(posedge aclk) started <= 1'b1;
@@ -134,58 +120,130 @@ module rmc_cif_r_resp_fv #(
   wire [16:0] span_end = 17'(alo_aligned) + ((17'(resp_len) + 17'd1) << resp_size) - 17'd1;
   `ASSUME(m_in_page, !resp_valid || span_end[16:PAGE_LSB] == '0);
 
-  // independent reference walk: closed-form address + per-channel line counters. Latched on
-  // the same cycle the DUT latches (idle & a new response), advanced on the DUT's g_fire.
-  logic [7:0]                 r_beat;
-  logic [LINE_W-1:0]          r_line;
-  logic [OFF_W-1:0]           r_off;
-  logic [2:0]                 r_size;
-  logic [N_CH-1:0][SLOT_W-1:0] r_cnt;
-  logic [N_CH-1:0][SLOT_W-1:0] r_head;
+  // the ROB keeps the response offered until it is taken
+  `ASSUME(m_resp_hold, `NEXT(resp_valid && !resp_ready, resp_valid));
 
-  wire [OFF_W:0] r_off_nxt  = {1'b0, r_off} + (OFF_W+1)'(1 << r_size);
-  wire           r_off_wrap = r_off_nxt[OFF_W];
-  wire           dut_latch  = !run && resp_valid;   // the DUT's start condition
+  // ------------------------------------------------------------------------
+  // reference: the request as latched from the PORTS, and closed-form answers
+  //   addr(b)    = align_down(addr_lo, size) + b * 2^size        (12-bit, in page)
+  //   line(b)    = addr(b)[11:6]      chunk(b) = addr(b)[5:BEAT_LSB]
+  //   slot(b)    = head[ch] + (lines l0 <= j < line(b) with chan(j) == ch)
+  // i.e. the k-th line of a channel in the request sits k slots after that channel's
+  // head - exactly how the splitter stored it. No counters are mirrored.
+  // ------------------------------------------------------------------------
+  wire dut_latch = !run && resp_valid;                 // the DUT's start condition
+
+  logic [PAGE_LSB-1:0]         r_lo;                   // aligned start address in page
+  logic [2:0]                  r_size;
+  logic [7:0]                  r_len;
+  logic [CH_W-1:0]             r_bch;
+  logic [N_CH-1:0][SLOT_W-1:0] r_head;
+  logic                        r_err;
+  logic [AXI_IDW-1:0]          r_id;
+  logic [7:0]                  r_out;                  // R beats accepted so far
 
   always_ff @(posedge aclk or negedge aresetn) begin
     if (!aresetn) begin
-      r_beat <= '0; r_line <= '0; r_off <= '0; r_cnt <= '0;
-    end else if (resp_ready && d_last && rvalid && rready) begin
-      // request released; counters reset for the next one on dut_latch
-      r_cnt <= '0;
-    end else if (dut_latch) begin
-      r_beat <= '0;
-      r_line <= resp_addr_lo[PAGE_LSB-1 : OFF_W];
-      r_off  <= resp_addr_lo[OFF_W-1 : 0] & ~OFF_W'((1 << resp_size) - 1);
-      r_size <= resp_size;
-      r_head <= resp_head_ptr;
-      r_cnt  <= '0;
-    end else if (g_fire && !is_last) begin
-      r_beat <= r_beat + 8'd1;
-      r_off  <= r_off_nxt[OFF_W-1:0];
-      if (r_off_wrap) begin
-        r_line        <= r_line + 1'b1;
-        r_cnt[ref_chan(r_line)] <= r_cnt[ref_chan(r_line)] + 1'b1;
+      r_out <= '0;
+    end else begin
+      if (rvalid && rready) r_out <= r_out + 8'd1;
+      if (dut_latch) begin
+        r_lo   <= resp_addr_lo & ~PAGE_LSB'((1 << resp_size) - 1);
+        r_size <= resp_size;
+        r_len  <= resp_len;
+        r_bch  <= resp_base_ch;
+        r_head <= resp_head_ptr;
+        r_err  <= (resp_resp != 2'b00);
+        r_id   <= resp_id;
+        r_out  <= '0;
       end
     end
   end
 
-  // 1. walk: the DUT counters equal the reference walk
-  `ASSERT(a_beat, !run || beat_q == r_beat);
-  `ASSERT(a_line, !run || line_q == r_line);
-  `ASSERT(a_off,  !run || off_q  == r_off);
-  `ASSERT(a_size, !run || size_q == r_size);
-  `ASSERT(a_chunk, !run || chunk == off_q[OFF_W-1:BEAT_LSB]);
+  // channel of page line ln, from the descriptor (bits below the page from the line
+  // address, bits above it from base_ch). The splitter proves this equals the full
+  // address decode (a_rebuild there), so it is the oracle here.
+  function automatic logic [CH_W-1:0] ref_chan(input logic [LINE_W-1:0] ln);
+    logic [PAGE_LSB-1:0] tag;
+    int src;
+    tag = {ln, {OFF_W{1'b0}}};
+    ref_chan = '0;
+    for (int k = 0; k < CH_W; k++)
+      if (k < int'(cfg_n_ch_log2)) begin
+        src = int'(addr_map[OFF_W + k]);
+        ref_chan[k] = (src < PAGE_LSB) ? tag[(src < PAGE_LSB) ? src : 0] : r_bch[k];
+      end
+  endfunction
 
-  // 2. slot: the DUT's channel + per-channel counters drive the right RD-SRAM address
-  for (genvar c = 0; c < N_CH_L; c++) begin : g_cnt
-    `ASSERT(a_cnt, !run || cnt_q[c] == r_cnt[c]);
-  end
-  `ASSERT(a_ch,   !run || ch == ref_chan(line_q));                 // DUT channel == oracle
-  `ASSERT(a_slot, !run || slot == head_q[ch] + cnt_q[ch]);
+  function automatic logic [PAGE_LSB-1:0] ref_addr(input logic [7:0] b);
+    ref_addr = r_lo + PAGE_LSB'(32'(b) << r_size);
+  endfunction
+
+  // lines of channel c strictly between the first line and line ln
+  function automatic logic [SLOT_W-1:0] ref_before(input logic [CH_W-1:0] c,
+                                                   input logic [LINE_W-1:0] ln);
+    logic [LINE_W-1:0] l0;
+    l0 = r_lo[PAGE_LSB-1:OFF_W];
+    ref_before = '0;
+    for (int j = 0; j < (1 << LINE_W); j++)
+      if (LINE_W'(j) >= l0 && LINE_W'(j) < ln && ref_chan(LINE_W'(j)) == c)
+        ref_before = ref_before + 1'b1;
+  endfunction
+
+  function automatic logic [SLOT_W-1:0] ref_slot(input logic [LINE_W-1:0] ln);
+    ref_slot = r_head[ref_chan(ln)] + ref_before(ref_chan(ln), ln);
+  endfunction
+
+  // 1. walk: the counters are the closed-form address of the current beat
+  wire [PAGE_LSB-1:0] g_addr = ref_addr(beat_q);
+  `ASSERT(a_walk,  !run || {line_q, off_q} == g_addr);
+  `ASSERT(a_size,  !run || size_q == r_size);
+  `ASSERT(a_chunk, !run || chunk == off_q[OFF_W-1:BEAT_LSB]);
+  `ASSERT(a_beat_rng, !run || beat_q <= r_len);
+
+  // 2. slot: channel and RD-SRAM slot of the beat G is issuing
+  `ASSERT(a_ch,   !run || ch == ref_chan(line_q));
+  `ASSERT(a_slot, !run || slot == ref_slot(line_q));
   `ASSERT(a_rd_onehot, !(g_fire && !err_q) || (rdb_re == (N_CH'(1) << ch)));
   `ASSERT(a_rd_addr,   !(g_fire && !err_q) || rdb_addr[ch] == slot);
   `ASSERT(a_slot_rng,  !(g_fire && !err_q) || 32'(slot) < N_RDB);
+  for (genvar c = 0; c < N_CH; c++) begin : g_cnt
+    // helper: each channel's counter = its lines already left behind
+    `ASSERT(a_cnt, !run || cnt_q[c] == ref_before(CH_W'(c), line_q));
+  end
+
+  // 2b. data path: the beat on R is beat r_out of the burst, and the SRAM word under it
+  //     is the right one. d_* is what D slices rdata from; the SRAM was read at d_slot on
+  //     the previous edge, so rdb_dout this cycle is that slot's line.
+  wire [PAGE_LSB-1:0] d_addr = ref_addr(r_out);
+  logic [N_CH-1:0]             re_q;
+  logic [N_CH-1:0][SLOT_W-1:0] addr_q;
+  always_ff @(posedge aclk) begin
+    re_q   <= rdb_re;
+    addr_q <= rdb_addr;
+  end
+  wire [SUBB_W-1:0] d_chunk_w = rmc_cif_r_resp.d_chunk;
+  wire              d_err_w   = rmc_cif_r_resp.d_err;
+  `ASSERT(a_d_beat,  !rvalid || r_out <= r_len);
+  `ASSERT(a_d_last,  !rvalid || rlast == (r_out == r_len));
+  `ASSERT(a_d_ch,    !(rvalid && !d_err_w) || d_ch == ref_chan(d_addr[PAGE_LSB-1:OFF_W]));
+  `ASSERT(a_d_chunk, !(rvalid && !d_err_w) || d_chunk_w == d_addr[OFF_W-1:BEAT_LSB]);
+  `ASSERT(a_d_slot,  !(rvalid && !d_err_w) || d_slot == ref_slot(d_addr[PAGE_LSB-1:OFF_W]));
+  `ASSERT(a_d_read,  !(rvalid && !d_err_w) || ($past(aresetn) && re_q[d_ch] && addr_q[d_ch] == d_slot));
+  `ASSERT(a_d_rid,   !rvalid || (rid == r_id && rresp == (r_err ? 2'b10 : 2'b00)));
+  // helpers: D holds a beat only while the request runs, with the request's id / error,
+  // and G is at most one beat ahead of R
+  `ASSERT(a_h_d,     !d_valid || (run && d_err_w == err_q && rmc_cif_r_resp.d_rid == rid_q));
+  `ASSERT(a_h_req,   !run || (err_q == r_err && rid_q == r_id && len_q == r_len
+                              && bch_q == r_bch && head_q == r_head));
+  `ASSERT(a_h_ahead, !run || (g_last_done ? (32'(r_out) + (d_valid ? 1 : 0) == 32'(r_len) + 1)
+                                          : (32'(beat_q) == 32'(r_out) + (d_valid ? 1 : 0))));
+  // helpers: the latched request is legal - start aligned to the beat size, size legal,
+  // and the whole burst inside the page (these hold at latch by the input assumptions)
+  wire [16:0] r_end = 17'(r_lo) + ((17'(r_len) + 17'd1) << r_size) - 17'd1;
+  `ASSERT(a_h_legal, !run || ((r_lo & PAGE_LSB'((1 << r_size) - 1)) == '0
+                              && 32'(r_size) <= BEAT_LSB && r_end[16:PAGE_LSB] == '0));
+  `ASSERT(a_h_idle,  run || (!d_valid && !g_last_done));
 
   // 3. R-channel handshake + metadata
   `ASSERT(a_rvalid, rvalid == d_valid);
@@ -212,6 +270,10 @@ module rmc_cif_r_resp_fv #(
   `COVER(c_narrow,    run && 32'(size_q) < BEAT_LSB && rvalid); // a narrow burst in flight
   `COVER(c_two_ch,    run && cnt_q[0] != '0 && cnt_q[N_CH-1] != '0); // both channels used
   `COVER(c_slverr,    rvalid && rresp == 2'b10);
+  `COVER(c_narrow_x,  rvalid && rready && rlast && 32'(r_size) < BEAT_LSB
+                      && r_lo[OFF_W-1:0] != '0 && r_lo[PAGE_LSB-1:OFF_W] != d_addr[PAGE_LSB-1:OFF_W]);
+                                                                  // narrow, unaligned, crosses a line
+  `COVER(c_b2b,       dut_latch && $past(resp_ready));             // next request right after
 
   `undef ASSERT
   `undef COVER
