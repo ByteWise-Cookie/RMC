@@ -85,7 +85,7 @@ module rmc_cif_r_resp #(
   localparam int SRAM_W     = rmc_cfg_pkg::PKT_BYTES * 8,                 // 64 B packet / SRAM line
   localparam int SLOT_W     = (N_RDB > 1) ? $clog2(N_RDB) : 1,           // RD-SRAM slot index
   localparam int BEAT_BYTES = AXI_DW_L / 8,                              // bytes per full AXI beat
-  localparam int BEAT_LSB   = (BEAT_BYTES > 1) ? $clog2(BEAT_BYTES) : 1, // log2(full beat bytes) = max ar_size
+  localparam int BEAT_LSB   = $clog2(BEAT_BYTES),                        // log2(full beat bytes) = max ar_size (0 if 1 byte; it is an index, not a width)
   localparam int N_SUBB     = SRAM_W / AXI_DW_L,                         // AXI beats per 64 B packet
   localparam int SUBB_W     = (N_SUBB > 1) ? $clog2(N_SUBB) : 1,
   localparam int NCH_LOG_W  = $clog2(CH_W_L + 1)
@@ -110,9 +110,9 @@ module rmc_cif_r_resp #(
   input  logic [2:0]                         resp_size,      // ar_size (log2 bytes/beat)
 
   // RD-SRAM client-side read port, one per channel (MC writes; CIF drains)
-  output logic [N_CH_L-1:0]                  rdb_re,
-  output logic [N_CH_L-1:0][SLOT_W-1:0]      rdb_addr,
-  input  logic [N_CH_L-1:0][SRAM_W-1:0]      rdb_dout,
+  output logic [N_CH_L-1:0]                  rdb_re, // SRAM read enable
+  output logic [N_CH_L-1:0][SLOT_W-1:0]      rdb_addr, // SRAM read addr
+  input  logic [N_CH_L-1:0][SRAM_W-1:0]      rdb_dout, // SRAM read data 64Bytes
 
   // AXI R channel
   output logic [AXI_IDW-1:0]                 rid,
@@ -131,11 +131,11 @@ module rmc_cif_r_resp #(
   //   - a CH source bit >= PAGE_LSB is constant for the request -> take base_ch[k].
   // n_ch_log2 masks inactive channels, matching line_channel exactly.
   function automatic logic [CH_W_L-1:0] walk_channel(
-      input logic [PAGE_LSB_L-1:0]            adr_low_tag,
-      input logic [CH_W_L-1:0]                base_ch,
-      input logic [DEC_W_L-1:0][SEL_W_L-1:0]  amap,
-      input logic [NCH_LOG_W-1:0]             n_ch_log2);
-    logic [CH_W_L-1:0] c;
+      input logic [PAGE_LSB_L-1:0]            adr_low_tag, // 12bit lsb addr
+      input logic [CH_W_L-1:0]                base_ch, // packet 0 ch_addr
+      input logic [DEC_W_L-1:0][SEL_W_L-1:0]  amap, // addr map
+      input logic [NCH_LOG_W-1:0]             n_ch_log2); // ch_sel
+    logic [CH_W_L-1:0] c; //ch_ptr
     int src, idx;
     c = '0;
     for (int k = 0; k < CH_W_L; k++)
@@ -180,18 +180,25 @@ module rmc_cif_r_resp #(
   logic                  off_wrap;    // the step crosses out of the current 64 B line
   logic                  is_last;     // last beat of the burst (ar_len reached)
 
-  assign line_tag = {line_q, {OFF_W_L{1'b0}}};
-  assign ch       = walk_channel(line_tag, bch_q, addr_map, cfg_n_ch_log2);
-  assign chunk    = off_q[OFF_W_L-1 : BEAT_LSB];          // which AXI beat inside the 64 B packet
-  assign slot     = head_q[ch] + cnt_q[ch];               // channel's k-th stored line
-  assign off_nxt  = {1'b0, off_q} + (OFF_W_L+1)'(1 << size_q);  // step 2^size bytes
-  assign off_wrap = off_nxt[OFF_W_L];                     // carried out of the 64 B line
-  assign is_last  = (beat_q == len_q);                    // ar_len is beats-1
+  assign line_tag = {line_q, {OFF_W_L{1'b0}}};            // current line's in-page addr: line index up top, byte offset forced 0 (the channel decode only reads line bits)
+  assign ch       = walk_channel(line_tag, bch_q, addr_map, cfg_n_ch_log2); // ch = the DRAM channel this 64B line's data sits in, re-derived from the descriptor (window mux): the same channel the splitter routed the line to, so head_q[ch]/cnt_q[ch] below index the right per-channel run
+  // which AXI_DW beat within the 64B packet (offset bits above one beat width). When a beat
+  // is a whole packet (N_SUBB==1, i.e. AXI_DW==SRAM_W) BEAT_LSB==OFF_W and the slice would be
+  // null, so chunk is a constant 0.
+  if (N_SUBB > 1) begin : g_chunk
+    assign chunk = off_q[OFF_W_L-1 : BEAT_LSB];
+  end else begin : g_chunk1
+    assign chunk = '0;
+  end
+  assign slot     = head_q[ch] + cnt_q[ch];               // RD-SRAM slot to read: this channel's run base + how many of its lines already streamed
+  assign off_nxt  = {1'b0, off_q} + (OFF_W_L+1)'(1 << size_q);  // next in-line byte offset; extra top bit catches the carry; step = 2^ar_size bytes
+  assign off_wrap = off_nxt[OFF_W_L];                     // that carry bit = the step crossed out of this 64B line
+  assign is_last  = (beat_q == len_q);                    // reached ar_len (beats-1) -> this is the final beat
 
   // Elastic handshake G -> D. D can take a new beat when it is empty or draining this
   // cycle; G issues (and the walk advances) only when D can take it and G has beats left.
-  wire d_ready = ~d_valid | rready;
-  wire g_fire  = run & ~g_last_done & d_ready;
+  wire d_ready = ~d_valid | rready;                       // D can take a new beat: it is empty, or its held beat is accepted this cycle
+  wire g_fire  = run & ~g_last_done & d_ready;            // issue a beat now: running, final beat not yet issued, and D can take it
 
   // SRAM read drive. On an issue (g_fire) G reads the new beat's slot; dout lands in D
   // next cycle. While D is stalled (holding a beat, rready low, no issue) the in-flight
@@ -199,96 +206,115 @@ module rmc_cif_r_resp #(
   // Q across idle read cycles. For a narrow burst, consecutive same-chunk beats re-read
   // the same slot here too (off_q has not wrapped), which is exactly the intended hold.
   always_comb begin
-    rdb_re   = '0;
-    rdb_addr = '0;
-    if (g_fire & ~err_q) begin
-      rdb_re[ch]     = 1'b1;
-      rdb_addr[ch]   = slot;
-    end else if (d_valid & ~d_err) begin
-      rdb_re[d_ch]   = 1'b1;
-      rdb_addr[d_ch] = d_slot;
+    rdb_re   = '0;                                        // default: no channel is read this cycle
+    rdb_addr = '0;                                        // default read address
+    if (g_fire & ~err_q) begin                            // issuing a real (non-error) beat: read the new beat's slot
+      rdb_re[ch]     = 1'b1;                              // enable the read on this line's channel
+      rdb_addr[ch]   = slot;                              // at the slot computed above
+    end else if (d_valid & ~d_err) begin                 // stalled with a live beat (rready low, no issue): re-read it
+      rdb_re[d_ch]   = 1'b1;                              // keep reading the in-flight beat's channel
+      rdb_addr[d_ch] = d_slot;                            // at its registered slot, so dout stays valid without relying on the macro holding Q
     end
   end
 
   // R-channel outputs (D stage). rdata is the chunk-th AXI_DW word of the 64 B packet;
   // for a narrow beat the master reads only the lanes its address selects, so no masking
   // is done here (the other lanes carry adjacent bytes the master ignores).
-  assign rvalid = d_valid;
-  assign rid    = d_rid;
-  assign rresp  = d_err ? 2'b10 : 2'b00;                 // whole burst carries the request's resp
-  assign rlast  = d_valid & d_last;
-  assign rdata  = d_err ? '0 : rdb_dout[d_ch][d_chunk*AXI_DW_L +: AXI_DW_L];
+  assign rvalid = d_valid;                               // R beat valid whenever D holds one
+  assign rid    = d_rid;                                 // id of the request being streamed
+  assign rresp  = d_err ? 2'b10 : 2'b00;                 // SLVERR if the request errored, else OKAY (whole burst carries it)
+  assign rlast  = d_valid & d_last;                      // last-beat marker, set for the beat whose is_last was latched
+  assign rdata  = d_err ? '0 : rdb_dout[d_ch][d_chunk*AXI_DW_L +: AXI_DW_L]; // the chunk-th AXI_DW word of the held channel's 64B packet (zeros on error); narrow master extracts its lane
 
   // pop the ROB (and free this request's RD-SRAM run) when the final beat is accepted
-  assign resp_ready = d_valid & d_last & rready;
+  assign resp_ready = d_valid & d_last & rready;         // final beat handshakes -> release the ROB entry and its slots
 
   always_ff @(posedge aclk or negedge aresetn) begin
     if (!aresetn) begin
-      run         <= 1'b0;
-      g_last_done <= 1'b0;
-      d_valid     <= 1'b0;
+      run         <= 1'b0;                               // idle, no request in flight
+      g_last_done <= 1'b0;                               // no final beat issued yet
+      d_valid     <= 1'b0;                               // D stage empty
     end else begin
       // D stage: accept a new beat from G, or drain the held one
-      if (d_ready) begin
-        d_valid <= g_fire;
-        if (g_fire) begin
-          d_rid   <= rid_q;
-          d_err   <= err_q;
-          d_last  <= is_last;
-          d_ch    <= ch;
-          d_chunk <= chunk;
-          d_slot  <= slot;
+      if (d_ready) begin                                 // D is free to update (empty or accepted)
+        d_valid <= g_fire;                               // hold a beat iff G issued one this cycle, else go empty (bubble)
+        if (g_fire) begin                                // latch the issued beat's control for next-cycle output
+          d_rid   <= rid_q;                              // request id
+          d_err   <= err_q;                              // error flag (SLVERR)
+          d_last  <= is_last;                            // whether this is the final beat (drives rlast)
+          d_ch    <= ch;                                 // channel -> picks which rdb_dout to slice next cycle
+          d_chunk <= chunk;                              // sub-beat within the packet -> which AXI_DW slice
+          d_slot  <= slot;                               // slot, kept so a stall can re-read the same word
         end
       end
 
       // G stage: advance the walk on each issued beat
-      if (g_fire) begin
-        if (is_last) begin
-          g_last_done <= 1'b1;                            // stop issuing; wait for D to drain
+      if (g_fire) begin                                  // a beat was issued this cycle
+        if (is_last) begin                               // it was the final beat of the burst
+          g_last_done <= 1'b1;                            // stop issuing; wait for D to drain the last beat
         end else begin
-          beat_q <= beat_q + 8'd1;
-          off_q  <= off_nxt[OFF_W_L-1:0];                 // step 2^size within the line
-          if (off_wrap) begin
-            line_q      <= line_q + 1'b1;                 // crossed into the next 64 B line
-            cnt_q[ch]   <= cnt_q[ch] + 1'b1;              // the channel we leave advances a slot
+          beat_q <= beat_q + 8'd1;                        // next AXI beat index
+          off_q  <= off_nxt[OFF_W_L-1:0];                 // advance in-line offset by 2^size
+          if (off_wrap) begin                            // the step crossed into a new 64B line
+            line_q      <= line_q + 1'b1;                 // move to the next line index
+            cnt_q[ch]   <= cnt_q[ch] + 1'b1;              // the channel we just left advances its slot counter
           end
         end
       end
 
       // request boundary
-      if (resp_ready) begin
-        run         <= 1'b0;                             // last beat accepted; ROB popped, slots freed
-        g_last_done <= 1'b0;
-      end else if (!run && resp_valid) begin
+      if (resp_ready) begin                              // final beat accepted this cycle
+        run         <= 1'b0;                             // request done; ROB popped and slots freed
+        g_last_done <= 1'b0;                             // clear for the next request
+      end else if (!run && resp_valid) begin             // idle and a retired request is waiting: latch it and start
         // latch the oldest retired request and start walking it. off_q starts size-aligned
         // inside line L0 (the splitter aligns the start to ar_size, which is <= 64 B, so the
         // start line is addr_lo's line index directly).
-        run    <= 1'b1;
-        rid_q  <= resp_id;
-        err_q  <= (resp_resp != 2'b00);
-        head_q <= resp_head_ptr;
-        bch_q  <= resp_base_ch;
-        len_q  <= resp_len;
-        size_q <= resp_size;
-        beat_q <= '0;
-        line_q <= resp_addr_lo[PAGE_LSB_L-1 : OFF_W_L];
-        off_q  <= resp_addr_lo[OFF_W_L-1 : 0] & ~OFF_W_L'((1 << resp_size) - 1);
+        run    <= 1'b1;                                  // begin streaming
+        rid_q  <= resp_id;                               // latch the AXI id
+        err_q  <= (resp_resp != 2'b00);                  // latch error: any non-OKAY resp -> SLVERR burst
+        head_q <= resp_head_ptr;                         // per-channel RD-SRAM run bases
+        bch_q  <= resp_base_ch;                          // channel of line 0 (holds the frozen out-of-page CH bits)
+        len_q  <= resp_len;                              // ar_len (beats - 1)
+        size_q <= resp_size;                             // ar_size (log2 bytes per beat)
+        beat_q <= '0;                                    // start at beat 0
+        line_q <= resp_addr_lo[PAGE_LSB_L-1 : OFF_W_L];  // start line index = addr_lo's line bits
+        off_q  <= resp_addr_lo[OFF_W_L-1 : 0] & ~OFF_W_L'((1 << resp_size) - 1); // start offset within the line, aligned down to ar_size
         cnt_q  <= '0;                                     // per-channel line counters start at 0
       end
     end
   end
 
 `ifndef SYNTHESIS
+  // elaboration/param guards. The per-channel slot pointer is head_q[ch] + cnt_q[ch] in
+  // SLOT_W bits, so it wraps at 2^SLOT_W; that only matches the ring when N_RDB is a power
+  // of two (otherwise a run that wraps reads the wrong slot). CH_W < 1 (single channel)
+  // collapses every [CH_W-1:0] vector and is not supported yet.
+  initial begin
+    if ((1 << SLOT_W) != N_RDB)
+      $fatal(1, "r_resp: N_RDB (%0d) must be a power of two", N_RDB);
+    if (CH_W_L < 1)
+      $fatal(1, "r_resp: single-channel build (CH_W=0) not supported");
+  end
+
   // a non-error beat being issued must address a real slot; recovered channel must be
   // active; ar_size must not exceed the full bus width (a legal AXI read).
-  always @(posedge aclk) if (aresetn && g_fire && !err_q) begin
-    assert (32'(slot) < N_RDB)
+  always @(posedge aclk) if (aresetn && g_fire && !err_q) begin   // only on a real issued beat
+    assert (32'(slot) < N_RDB)                                     // the read must land on a real RD-SRAM slot
       else $error("r_resp: slot %0d out of range (N_RDB=%0d)", slot, N_RDB);
-    assert (int'(ch) < (1 << cfg_n_ch_log2))
+    assert (int'(ch) < (1 << cfg_n_ch_log2))                       // the recovered channel must be one of the active channels
       else $error("r_resp: recovered channel %0d exceeds active channels", ch);
-    assert (int'(size_q) <= BEAT_LSB)
+    assert (int'(size_q) <= BEAT_LSB)                              // ar_size cannot exceed the full bus width (a legal AXI read)
       else $error("r_resp: ar_size %0d exceeds full-width %0d", size_q, BEAT_LSB);
   end
+
+  // the address map must route each active CH bit from at or above the 64B line offset; a
+  // source below it would make line_tag feed a forced-0 bit and silently corrupt the channel.
+  always @(posedge aclk) if (aresetn && run)
+    for (int k = 0; k < CH_W_L; k++)
+      if (k < int'(cfg_n_ch_log2))
+        assert (int'(addr_map[OFF_W_L + k]) >= OFF_W_L)
+          else $error("r_resp: CH source bit %0d is below the line offset", k);
 `endif
 
 endmodule : rmc_cif_r_resp
