@@ -63,7 +63,7 @@
 // bounded (addr-gen | array+slice | output) and gives a clean registered R output with no
 // post-SRAM combinational path to the port. The elastic ready chain (d_ready -> a_ready ->
 // g_fire) stalls the walk under rready back-pressure; a stall just holds the A and D
-// registers, so there is no re-read and no reliance on the macro holding its output.
+// registers, and the held beat's data stays valid because D captured it.
 // Latency: a beat reaches R two cycles after its read is issued.
 //
 // Assumptions:

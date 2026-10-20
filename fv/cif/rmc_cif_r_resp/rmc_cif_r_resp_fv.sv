@@ -201,20 +201,63 @@ module rmc_cif_r_resp_fv #(
   // 2. slot: channel and RD-SRAM slot of the beat G is issuing
   `ASSERT(a_ch,   !run || ch == ref_chan(line_q));
   `ASSERT(a_slot, !run || slot == ref_slot(line_q));
-  `ASSERT(a_rd_onehot, !(g_fire && !err_q) || (rdb_re == (N_CH'(1) << ch)));
-  `ASSERT(a_rd_addr,   !(g_fire && !err_q) || rdb_addr[ch] == slot);
   `ASSERT(a_slot_rng,  !(g_fire && !err_q) || 32'(slot) < N_RDB);
   for (genvar c = 0; c < N_CH; c++) begin : g_cnt
     // helper: each channel's counter = its lines already left behind
     `ASSERT(a_cnt, !run || cnt_q[c] == ref_before(CH_W'(c), line_q));
   end
 
-  // 2b. data path. The reorder correctness - each fetch reads head_ptr[ch] + before(ch,line)
-  //     - is proved at the ISSUE stage (a_ch/a_slot/a_rd_addr above), when the address is
-  //     computed and registered into A. With the A (address) and D (data) registers the R
-  //     beat carries that fetch's slice two cycles later, so here we tie only the R stream's
-  //     shape (beat index, rlast, id/resp) to the request; the exact slot per R beat follows
-  //     transitively from the issue check plus the in-order A->D->R flow.
+  // 2b. data path, through the A (registered SRAM address) and D (registered word)
+  //     stages. Beats stay in order, so the beat in D is r_out (next for R) and the beat
+  //     in A is r_out + d_valid.
+  //
+  //     SRAM content is modelled with ONE watched location: channel w_ch, slot w_slot,
+  //     holding the 64 B line w_data. All three are constants the solver picks freely
+  //     (flops that only hold their value). The RD-SRAM is asynchronous: whenever channel
+  //     w_ch is addressed at w_slot, rdb_dout[w_ch] is w_data. Then: every R beat whose
+  //     line lives at (w_ch, w_slot) must carry the right AXI_DW slice of w_data. Since
+  //     the location and the data are arbitrary, that covers every beat and every value.
+  localparam int SRAM_W_L = rmc_cfg_pkg::PKT_BYTES * 8;
+  localparam int DW_L     = rmc_cfg_pkg::AXI_DW;
+  logic [CH_W-1:0]     w_ch;
+  logic [SLOT_W-1:0]   w_slot;
+  logic [SRAM_W_L-1:0] w_data;
+  always_ff @(posedge aclk) begin
+    w_ch   <= w_ch;
+    w_slot <= w_slot;
+    w_data <= w_data;
+  end
+  `ASSUME(m_sram, !(rdb_addr[w_ch] == w_slot) || rmc_cif_r_resp.rdb_dout[w_ch] == w_data);
+
+  // expected fetch of beat b: channel, slot and chunk from the closed form
+  function automatic logic [SUBB_W-1:0] ref_chunk(input logic [PAGE_LSB-1:0] ad);
+    ref_chunk = (SUBB_W'(ad[OFF_W-1:0] >> BEAT_LSB));
+  endfunction
+
+  wire [7:0]          a_beat = r_out + 8'(d_valid);
+  wire [PAGE_LSB-1:0] a_ad   = ref_addr(a_beat);
+  wire [PAGE_LSB-1:0] d_ad   = ref_addr(r_out);
+  wire [CH_W-1:0]     a_ch_e = ref_chan(a_ad[PAGE_LSB-1:OFF_W]);
+  wire [CH_W-1:0]     d_ch_e = ref_chan(d_ad[PAGE_LSB-1:OFF_W]);
+  wire                a_v    = rmc_cif_r_resp.a_valid;
+
+  // A stage: the registered SRAM read is the fetch of beat a_beat
+  `ASSERT(a_a_beat,  !a_v || (a_beat <= r_len && rmc_cif_r_resp.a_err == r_err
+                             && rmc_cif_r_resp.a_rid == r_id
+                             && rmc_cif_r_resp.a_last == (a_beat == r_len)));
+  `ASSERT(a_a_fetch, !(a_v && !r_err) || (
+                        rmc_cif_r_resp.a_ch    == a_ch_e
+                     && rmc_cif_r_resp.a_chunk == ref_chunk(a_ad)
+                     && rdb_re == (N_CH'(1) << a_ch_e)
+                     && rdb_addr[a_ch_e] == ref_slot(a_ad[PAGE_LSB-1:OFF_W])));
+  `ASSERT(a_a_noread, a_v && !r_err || rdb_re == '0);           // no stray SRAM reads
+
+  // R: the word on rdata is the right slice of the right line (0 on an error burst)
+  wire d_hit = (d_ch_e == w_ch) && (ref_slot(d_ad[PAGE_LSB-1:OFF_W]) == w_slot);
+  `ASSERT(a_d_data,  !(rvalid && !r_err && d_hit)
+                     || rmc_cif_r_resp.rdata == w_data[ref_chunk(d_ad)*DW_L +: DW_L]);
+  `ASSERT(a_d_zero,  !(rvalid && r_err) || rmc_cif_r_resp.rdata == '0);
+
   wire d_err_w = rmc_cif_r_resp.d_err;
   `ASSERT(a_d_beat, !rvalid || r_out <= r_len);
   `ASSERT(a_d_last, !rvalid || rlast == (r_out == r_len));
@@ -225,8 +268,10 @@ module rmc_cif_r_resp_fv #(
   `ASSERT(a_h_d,     !d_valid || (run && d_err_w == r_err && rmc_cif_r_resp.d_rid == r_id));
   `ASSERT(a_h_req,   !run || (err_q == r_err && rid_q == r_id && len_q == r_len
                               && bch_q == r_bch && head_q == r_head));
-  `ASSERT(a_h_ahead, !run || g_last_done
-                     || (32'(beat_q) == 32'(r_out) + (a_valid ? 1 : 0) + (d_valid ? 1 : 0)));
+  `ASSERT(a_h_ahead, !run || (g_last_done
+                     ? (32'(r_out) + (a_valid ? 1 : 0) + (d_valid ? 1 : 0) == 32'(r_len) + 1)
+                     : (32'(beat_q) == 32'(r_out) + (a_valid ? 1 : 0) + (d_valid ? 1 : 0))));
+  `ASSERT(a_h_a,     !a_valid || run);
   // helpers: the latched request is legal - start aligned to the beat size, size legal,
   // and the whole burst inside the page (these hold at latch by the input assumptions)
   wire [16:0] r_end = 17'(r_lo) + ((17'(r_len) + 17'd1) << r_size) - 17'd1;
@@ -241,7 +286,7 @@ module rmc_cif_r_resp_fv #(
   `ASSERT(a_rlast,  rlast == (d_valid && d_last));
   `ASSERT(a_last,   is_last == (beat_q == len_q));
   `ASSERT(a_resprdy, resp_ready == (d_valid && d_last && rready));
-  // a held beat stays put and stable; rdata too, now that D registers the sliced word
+  // a held beat stays put and stable, rdata included (D registers the sliced word)
   `ASSERT(a_hold, `NEXT(rvalid && !rready, rvalid && $stable(rid) && $stable(rresp)
                         && $stable(rlast) && $stable(rmc_cif_r_resp.rdata)));
   // the last accepted beat releases the request
@@ -264,6 +309,7 @@ module rmc_cif_r_resp_fv #(
                       && r_lo[OFF_W-1:0] != '0
                       && r_lo[PAGE_LSB-1:OFF_W] != ref_addr(r_out)[PAGE_LSB-1:OFF_W]);
                                                                   // narrow, unaligned, crosses a line
+  `COVER(c_w_hit,     rvalid && rready && !r_err && d_hit && !rlast); // a watched word reaches R
   `COVER(c_b2b,       dut_latch && $past(resp_ready));             // next request right after
 
   `undef ASSERT
