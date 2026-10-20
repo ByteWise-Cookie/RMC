@@ -13,7 +13,7 @@
 // To stream R we walk the burst beat by beat and, for each beat, recover WHICH
 // channel its line sits in and WHICH slot inside that channel.
 //
-// THE WALK: two small counters, not a 12-bit address adder  ("our idea")
+// THE WALK: two small counters, not a 12-bit address adder
 // The channel of a line is a pure function of the line INDEX (the map's CH source
 // bits all sit at or above the 64 B line offset), and on an INCR run the line index
 // just steps up. So instead of re-forming a full byte address every beat and slicing
@@ -35,8 +35,8 @@
 // does NOT shift or mask: it presents the aligned AXI_DW word (the chunk slice) and
 // the master extracts its lane. All that changes versus full-width is the address
 // STEP (2^size, not the full beat width), which makes several beats fall on the same
-// chunk/line before off_q wraps. One SRAM line therefore feeds many beats; its slot
-// is simply held (re-read) until the walk crosses out of it. Beat count and rlast
+// chunk/line before off_q wraps. The walk stays on that line (same ch/slot) until off_q
+// crosses out of it, so each of those beats reads the same slot. Beat count and rlast
 // come straight from ar_len (beat_q == len_q), independent of size.
 //   - ar_size == full (2^size == AXI_DW/8): off_q steps a full beat, chunk advances
 //     every beat, a 64 B line = N_SUBB beats. Streams with no internal hold.
