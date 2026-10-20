@@ -95,11 +95,13 @@ module rmc_cif #(
   // counter, always absorbable in one cycle, so it must never back-pressure
   // (blocking a done-signal deadlocks the round trip). Only drop on soft-reset drain.
   input  logic [ROB_IDX_W-1:0]   async_mc_cmpl_rob_index,  // completion = pulse + this
+  input  logic                   async_mc_cmpl_op,         // 0 = read (-> r_rob), 1 = write (-> w_rob)
 
-  // WD_SRAM client-side write port (CIF writes W beats; MC reads)
-  output logic                     wdb_we,
-  output logic [$clog2(N_WDB)-1:0] wdb_addr,
-  output logic [SRAM_W-1:0]        wdb_din,
+  // WD_SRAM client-side write port, one per channel (CIF/write_alloc writes; MC reads).
+  // Per-channel: a line's data lives in its channel's WD-SRAM, symmetric to rdb_*.
+  output logic [N_CH-1:0]                    wdb_we,
+  output logic [N_CH-1:0][$clog2(N_WDB)-1:0] wdb_addr,
+  output logic [N_CH-1:0][SRAM_W-1:0]        wdb_din,
 
   // RD_SRAM client-side read port, one per channel (MC writes; CIF drains to R).
   // Per-channel: each read engine owns its channel's RD-SRAM, and r_resp reads the
@@ -254,9 +256,11 @@ module rmc_cif #(
 
   // completion never back-pressures: tie ready high. A completion only bumps a
   // counter on an already-allocated entry, always absorbable in one cycle.
-  // TODO: route cmpl to r_rob/w_rob by a direction bit in the tag; drop only on
-  // a soft-reset drain.
+  // Demux by async_mc_cmpl_op: read completions go to r_rob, writes to w_rob. The
+  // two ROB index spaces overlap, so the direction bit is what tells them apart.
   assign async_mc_cmpl_ready = 1'b1;
+  wire cmpl_rd = async_mc_cmpl_valid & ~async_mc_cmpl_op;
+  wire cmpl_wr = async_mc_cmpl_valid &  async_mc_cmpl_op;
 
   // PLAN (not built here yet): a pre-ROB AW_req buffer sits post request_validator
   // and before the ROB, one per direction. It holds the phys addr (which the ROB
@@ -277,7 +281,7 @@ module rmc_cif #(
   ) u_rrob (
     .aclk           (aclk),
     .aresetn        (aresetn),
-    .cmpl_valid     (async_mc_cmpl_valid),
+    .cmpl_valid     (cmpl_rd),
     .cmpl_rob_index (async_mc_cmpl_rob_index),
     .AW_REQUEST     ({ar_admit_id, ar_admit_validated}),
     .ADMIT_NPKTS    (ar_admit_npkts),
@@ -341,15 +345,26 @@ module rmc_cif #(
   ) u_wrob (
     .aclk           (aclk),
     .aresetn        (aresetn),
-    .cmpl_valid     (async_mc_cmpl_valid),
+    .cmpl_valid     (cmpl_wr),
     .cmpl_rob_index (async_mc_cmpl_rob_index),
+    .cmpl_err       (1'b0),                   // TODO: carry a cmpl error bit from the MC
     .AW_REQUEST     ({awid, awlen, awsize, aw_ok}),
     .A_ID_VALID     (awvalid),
-    .A_ID_READY     (awready)
-    // TODO: SEG_* from u_wseg; RESP_* -> B response path
+    .A_ID_READY     (awready),
+    // SEG_* from u_wseg (not built yet) - tied off so nothing retires until writes flow
+    .ROB_IDX        (/* TODO: -> u_wseg */),
+    .SEG_LAST       (1'b0),
+    .SEG_NPKTS      ('0),
+    .SEG_HEAD_PTR   ('0),
+    // retire -> AXI B response
+    .RESP_VALID     (bvalid),
+    .RESP_READY     (bready),
+    .RESP_ID        (bid),
+    .RESP_RESP      (bresp),
+    .RESP_HEAD_PTR  (/* TODO: -> write_alloc slot free */)
   );
 
-  // request builder / response stubs (TODO)
+  // request builder stubs (TODO: fed by u_wseg once the write issue path is built)
   assign async_mc_req_valid       = 1'b0;
   assign async_mc_req_rob_index   = '0;
   assign async_mc_req_op          = 1'b0;
@@ -359,13 +374,10 @@ module rmc_cif #(
   assign async_mc_req_sram_slot   = '0;
 
   // awready / arready are driven by the ROBs' A_ID_READY (admit backpressure).
-  // R channel + rdb_* are now driven by u_r_resp.
-  assign wready  = 1'b0;
-  assign bid     = '0;
-  assign bresp   = 2'b00;
-  assign bvalid  = 1'b0;
+  // R channel + rdb_* are driven by u_r_resp; the B channel by u_wrob (above).
+  assign wready  = 1'b0;                      // TODO: W-data capture + write_alloc
 
-  assign wdb_we   = 1'b0;
+  assign wdb_we   = '0;
   assign wdb_addr = '0;
   assign wdb_din  = '0;
 
