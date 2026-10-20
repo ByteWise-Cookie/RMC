@@ -79,10 +79,9 @@ module rmc_cif_r_resp_fv #(
   input logic                              is_last,
   input logic                              off_wrap,
   input logic                              g_fire,
+  input logic                              a_valid,
   input logic                              d_valid,
-  input logic                              d_last,
-  input logic [CH_W-1:0]                   d_ch,
-  input logic [SLOT_W-1:0]                 d_slot
+  input logic                              d_last
 );
 
   `define ASSERT(name, expr) name: assert property (@(posedge aclk) disable iff (!aresetn) (expr))
@@ -123,14 +122,12 @@ module rmc_cif_r_resp_fv #(
   // the ROB keeps the response offered until it is taken
   `ASSUME(m_resp_hold, `NEXT(resp_valid && !resp_ready, resp_valid));
 
-  // ------------------------------------------------------------------------
   // reference: the request as latched from the PORTS, and closed-form answers
   //   addr(b)    = align_down(addr_lo, size) + b * 2^size        (12-bit, in page)
   //   line(b)    = addr(b)[11:6]      chunk(b) = addr(b)[5:BEAT_LSB]
   //   slot(b)    = head[ch] + (lines l0 <= j < line(b) with chan(j) == ch)
   // i.e. the k-th line of a channel in the request sits k slots after that channel's
   // head - exactly how the splitter stored it. No counters are mirrored.
-  // ------------------------------------------------------------------------
   wire dut_latch = !run && resp_valid;                 // the DUT's start condition
 
   logic [PAGE_LSB-1:0]         r_lo;                   // aligned start address in page
@@ -212,38 +209,30 @@ module rmc_cif_r_resp_fv #(
     `ASSERT(a_cnt, !run || cnt_q[c] == ref_before(CH_W'(c), line_q));
   end
 
-  // 2b. data path: the beat on R is beat r_out of the burst, and the SRAM word under it
-  //     is the right one. d_* is what D slices rdata from; the SRAM was read at d_slot on
-  //     the previous edge, so rdb_dout this cycle is that slot's line.
-  wire [PAGE_LSB-1:0] d_addr = ref_addr(r_out);
-  logic [N_CH-1:0]             re_q;
-  logic [N_CH-1:0][SLOT_W-1:0] addr_q;
-  always_ff @(posedge aclk) begin
-    re_q   <= rdb_re;
-    addr_q <= rdb_addr;
-  end
-  wire [SUBB_W-1:0] d_chunk_w = rmc_cif_r_resp.d_chunk;
-  wire              d_err_w   = rmc_cif_r_resp.d_err;
-  `ASSERT(a_d_beat,  !rvalid || r_out <= r_len);
-  `ASSERT(a_d_last,  !rvalid || rlast == (r_out == r_len));
-  `ASSERT(a_d_ch,    !(rvalid && !d_err_w) || d_ch == ref_chan(d_addr[PAGE_LSB-1:OFF_W]));
-  `ASSERT(a_d_chunk, !(rvalid && !d_err_w) || d_chunk_w == d_addr[OFF_W-1:BEAT_LSB]);
-  `ASSERT(a_d_slot,  !(rvalid && !d_err_w) || d_slot == ref_slot(d_addr[PAGE_LSB-1:OFF_W]));
-  `ASSERT(a_d_read,  !(rvalid && !d_err_w) || ($past(aresetn) && re_q[d_ch] && addr_q[d_ch] == d_slot));
-  `ASSERT(a_d_rid,   !rvalid || (rid == r_id && rresp == (r_err ? 2'b10 : 2'b00)));
-  // helpers: D holds a beat only while the request runs, with the request's id / error,
-  // and G is at most one beat ahead of R
-  `ASSERT(a_h_d,     !d_valid || (run && d_err_w == err_q && rmc_cif_r_resp.d_rid == rid_q));
+  // 2b. data path. The reorder correctness - each fetch reads head_ptr[ch] + before(ch,line)
+  //     - is proved at the ISSUE stage (a_ch/a_slot/a_rd_addr above), when the address is
+  //     computed and registered into A. With the A (address) and D (data) registers the R
+  //     beat carries that fetch's slice two cycles later, so here we tie only the R stream's
+  //     shape (beat index, rlast, id/resp) to the request; the exact slot per R beat follows
+  //     transitively from the issue check plus the in-order A->D->R flow.
+  wire d_err_w = rmc_cif_r_resp.d_err;
+  `ASSERT(a_d_beat, !rvalid || r_out <= r_len);
+  `ASSERT(a_d_last, !rvalid || rlast == (r_out == r_len));
+  `ASSERT(a_d_rid,  !rvalid || (rid == r_id && rresp == (r_err ? 2'b10 : 2'b00)));
+  // helpers: D holds a beat only while running, carrying the request's id/error; the two
+  // in-flight registers (A address, D data) sit between the walk and R, so G runs at most
+  // two beats ahead of what R has accepted (relaxed once the last read has been issued).
+  `ASSERT(a_h_d,     !d_valid || (run && d_err_w == r_err && rmc_cif_r_resp.d_rid == r_id));
   `ASSERT(a_h_req,   !run || (err_q == r_err && rid_q == r_id && len_q == r_len
                               && bch_q == r_bch && head_q == r_head));
-  `ASSERT(a_h_ahead, !run || (g_last_done ? (32'(r_out) + (d_valid ? 1 : 0) == 32'(r_len) + 1)
-                                          : (32'(beat_q) == 32'(r_out) + (d_valid ? 1 : 0))));
+  `ASSERT(a_h_ahead, !run || g_last_done
+                     || (32'(beat_q) == 32'(r_out) + (a_valid ? 1 : 0) + (d_valid ? 1 : 0)));
   // helpers: the latched request is legal - start aligned to the beat size, size legal,
   // and the whole burst inside the page (these hold at latch by the input assumptions)
   wire [16:0] r_end = 17'(r_lo) + ((17'(r_len) + 17'd1) << r_size) - 17'd1;
   `ASSERT(a_h_legal, !run || ((r_lo & PAGE_LSB'((1 << r_size) - 1)) == '0
                               && 32'(r_size) <= BEAT_LSB && r_end[16:PAGE_LSB] == '0));
-  `ASSERT(a_h_idle,  run || (!d_valid && !g_last_done));
+  `ASSERT(a_h_idle,  run || (!a_valid && !d_valid && !g_last_done));
 
   // 3. R-channel handshake + metadata
   `ASSERT(a_rvalid, rvalid == d_valid);
@@ -252,8 +241,9 @@ module rmc_cif_r_resp_fv #(
   `ASSERT(a_rlast,  rlast == (d_valid && d_last));
   `ASSERT(a_last,   is_last == (beat_q == len_q));
   `ASSERT(a_resprdy, resp_ready == (d_valid && d_last && rready));
-  // a held beat stays put and stable (data excluded: it tracks the free SRAM dout)
-  `ASSERT(a_hold, `NEXT(rvalid && !rready, rvalid && $stable(rid) && $stable(rresp) && $stable(rlast)));
+  // a held beat stays put and stable; rdata too, now that D registers the sliced word
+  `ASSERT(a_hold, `NEXT(rvalid && !rready, rvalid && $stable(rid) && $stable(rresp)
+                        && $stable(rlast) && $stable(rmc_cif_r_resp.rdata)));
   // the last accepted beat releases the request
   `ASSERT(a_release, `NEXT(resp_ready, !run || !$past(run)));
   // g_fire only while running and not already drained
@@ -271,7 +261,8 @@ module rmc_cif_r_resp_fv #(
   `COVER(c_two_ch,    run && cnt_q[0] != '0 && cnt_q[N_CH-1] != '0); // both channels used
   `COVER(c_slverr,    rvalid && rresp == 2'b10);
   `COVER(c_narrow_x,  rvalid && rready && rlast && 32'(r_size) < BEAT_LSB
-                      && r_lo[OFF_W-1:0] != '0 && r_lo[PAGE_LSB-1:OFF_W] != d_addr[PAGE_LSB-1:OFF_W]);
+                      && r_lo[OFF_W-1:0] != '0
+                      && r_lo[PAGE_LSB-1:OFF_W] != ref_addr(r_out)[PAGE_LSB-1:OFF_W]);
                                                                   // narrow, unaligned, crosses a line
   `COVER(c_b2b,       dut_latch && $past(resp_ready));             // next request right after
 

@@ -50,8 +50,7 @@ bind rmc_cif_r_resp rmc_cif_r_resp_fv #(
   .is_last       (is_last),
   .off_wrap      (off_wrap),
   .g_fire        (g_fire),
+  .a_valid       (a_valid),
   .d_valid       (d_valid),
-  .d_last        (d_last),
-  .d_ch          (d_ch),
-  .d_slot        (d_slot)
+  .d_last        (d_last)
 );

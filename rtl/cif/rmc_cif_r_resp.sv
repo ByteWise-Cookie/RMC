@@ -41,7 +41,7 @@
 //   - ar_size == full (2^size == AXI_DW/8): off_q steps a full beat, chunk advances
 //     every beat, a 64 B line = N_SUBB beats. Streams with no internal hold.
 //   - ar_size <  full: off_q steps less than a beat, so the chunk (hence the SRAM
-//     slot) is reused across 2^(BEAT_LSB-size) beats -- the read is "held down"
+//     slot) is reused across 2^(BEAT_LSB-size) beats -- the walk holds the line
 //     while the master drains that word lane by lane.
 //
 // FREEING RD-SRAM SLOTS
@@ -54,17 +54,22 @@
 // burst applies toward new reads / the MC.
 //
 // PIPELINE
-// Two stages, one beat per cycle, synchronous (1-cycle) RD-SRAM:
-//   G (addr-gen) : counters -> ch, chunk, slot -> drive rdb_addr/rdb_re.
-//   D (data/out) : next cycle the SRAM returns the 64 B packet; slice the chunk-th
-//                  AXI_DW word and present it on R.
-// A one-beat skid (d_valid) carries G's control to D so rready back-pressure stalls
-// the walk cleanly. While stalled the in-flight beat's slot is re-read so the SRAM
-// output stays valid without relying on the macro holding Q across idle reads.
+// Three stages, one beat per cycle, around an ASYNCHRONOUS (combinational-read) RD-SRAM:
+//   G (addr-gen) : counters -> ch, chunk, slot (combinational from the walk state).
+//   A (sram)     : register rdb_addr/rdb_re, so the SRAM sees a stable address and gets
+//                  its own cycle; the async array returns rdb_dout combinationally.
+//   D (data/out) : capture the sliced AXI_DW word in a register and drive R from it.
+// Registering both the address (A) and the sliced data (D) keeps the per-cycle logic
+// bounded (addr-gen | array+slice | output) and gives a clean registered R output with no
+// post-SRAM combinational path to the port. The elastic ready chain (d_ready -> a_ready ->
+// g_fire) stalls the walk under rready back-pressure; a stall just holds the A and D
+// registers, so there is no re-read and no reliance on the macro holding its output.
+// Latency: a beat reaches R two cycles after its read is issued.
 //
 // Assumptions:
 //   - INCR only, inside one 4 KB page (both guaranteed upstream). WRAP/FIXED TODO.
-//   - RD-SRAM read is SYNCHRONOUS (address in G, data in D next cycle).
+//   - RD-SRAM read is ASYNCHRONOUS: rdb_dout is combinational in the address driven the
+//     previous cycle (A registers the address, D registers the data).
 
 import rmc_cfg_pkg::*;
 
@@ -162,14 +167,22 @@ module rmc_cif_r_resp #(
   logic [OFF_W_L-1:0]            off_q;        // byte offset within the current line
   logic [N_CH_L-1:0][SLOT_W-1:0] cnt_q;        // per-channel lines left behind so far
 
-  // D stage: one beat of R control in flight, filled by G, drained by the R handshake.
+  // A stage: the read is in flight in the (async) RD-SRAM. rdb_addr/rdb_re are registered
+  // here, so the SRAM sees a stable address and gets its own cycle; a_* carry the control
+  // the D stage needs to slice the returned word.
+  logic                 a_valid;
+  logic [AXI_IDW-1:0]   a_rid;
+  logic                 a_err;
+  logic                 a_last;
+  logic [CH_W_L-1:0]    a_ch;                            // channel whose rdb_dout to slice
+  logic [SUBB_W-1:0]    a_chunk;                         // which AXI beat within the packet
+
+  // D stage: the sliced R beat, captured in a register (clean registered R output).
   logic                 d_valid;
   logic [AXI_IDW-1:0]   d_rid;
   logic                 d_err;
   logic                 d_last;
-  logic [CH_W_L-1:0]    d_ch;                            // channel whose SRAM dout to slice
-  logic [SUBB_W-1:0]    d_chunk;                         // which AXI beat within the packet
-  logic [SLOT_W-1:0]    d_slot;                          // its SRAM slot (re-read while stalled)
+  logic [AXI_DW_L-1:0]  d_data;                          // the AXI_DW beat, already sliced out
 
   // G-stage decode of the current beat from the two counters.
   logic [PAGE_LSB_L-1:0] line_tag;    // {line_q, 0}: line address for the channel decode
@@ -195,36 +208,20 @@ module rmc_cif_r_resp #(
   assign off_wrap = off_nxt[OFF_W_L];                     // that carry bit = the step crossed out of this 64B line
   assign is_last  = (beat_q == len_q);                    // reached ar_len (beats-1) -> this is the final beat
 
-  // Elastic handshake G -> D. D can take a new beat when it is empty or draining this
-  // cycle; G issues (and the walk advances) only when D can take it and G has beats left.
-  wire d_ready = ~d_valid | rready;                       // D can take a new beat: it is empty, or its held beat is accepted this cycle
-  wire g_fire  = run & ~g_last_done & d_ready;            // issue a beat now: running, final beat not yet issued, and D can take it
+  // Elastic ready chain over the two registered stages. A stage can take a new read when it
+  // is empty or its in-flight read moves into D this cycle; D can take a new beat when it is
+  // empty or its held beat is accepted on R this cycle; G issues (and the walk advances) only
+  // when A can take it and G still has beats.
+  wire d_ready = ~d_valid | rready;                       // D free: empty, or its beat accepted this cycle
+  wire a_ready = ~a_valid | d_ready;                      // A free: empty, or its read captured by D this cycle
+  wire g_fire  = run & ~g_last_done & a_ready;            // issue a read now: running, not past the last beat, A free
 
-  // SRAM read drive. On an issue (g_fire) G reads the new beat's slot; dout lands in D
-  // next cycle. While D is stalled (holding a beat, rready low, no issue) the in-flight
-  // beat's slot is re-read so its dout stays valid without depending on the macro holding
-  // Q across idle read cycles. For a narrow burst, consecutive same-chunk beats re-read
-  // the same slot here too (off_q has not wrapped), which is exactly the intended hold.
-  always_comb begin
-    rdb_re   = '0;                                        // default: no channel is read this cycle
-    rdb_addr = '0;                                        // default read address
-    if (g_fire & ~err_q) begin                            // issuing a real (non-error) beat: read the new beat's slot
-      rdb_re[ch]     = 1'b1;                              // enable the read on this line's channel
-      rdb_addr[ch]   = slot;                              // at the slot computed above
-    end else if (d_valid & ~d_err) begin                 // stalled with a live beat (rready low, no issue): re-read it
-      rdb_re[d_ch]   = 1'b1;                              // keep reading the in-flight beat's channel
-      rdb_addr[d_ch] = d_slot;                            // at its registered slot, so dout stays valid without relying on the macro holding Q
-    end
-  end
-
-  // R-channel outputs (D stage). rdata is the chunk-th AXI_DW word of the 64 B packet;
-  // for a narrow beat the master reads only the lanes its address selects, so no masking
-  // is done here (the other lanes carry adjacent bytes the master ignores).
+  // R-channel outputs, all from the D register (no post-SRAM combinational path to the port).
   assign rvalid = d_valid;                               // R beat valid whenever D holds one
   assign rid    = d_rid;                                 // id of the request being streamed
   assign rresp  = d_err ? 2'b10 : 2'b00;                 // SLVERR if the request errored, else OKAY (whole burst carries it)
-  assign rlast  = d_valid & d_last;                      // last-beat marker, set for the beat whose is_last was latched
-  assign rdata  = d_err ? '0 : rdb_dout[d_ch][d_chunk*AXI_DW_L +: AXI_DW_L]; // the chunk-th AXI_DW word of the held channel's 64B packet (zeros on error); narrow master extracts its lane
+  assign rlast  = d_valid & d_last;                      // last-beat marker (the beat whose is_last was latched)
+  assign rdata  = d_data;                                // the already-sliced AXI_DW beat
 
   // pop the ROB (and free this request's RD-SRAM run) when the final beat is accepted
   assign resp_ready = d_valid & d_last & rready;         // final beat handshakes -> release the ROB entry and its slots
@@ -233,25 +230,43 @@ module rmc_cif_r_resp #(
     if (!aresetn) begin
       run         <= 1'b0;                               // idle, no request in flight
       g_last_done <= 1'b0;                               // no final beat issued yet
+      a_valid     <= 1'b0;                               // A stage empty (no read in flight)
       d_valid     <= 1'b0;                               // D stage empty
+      rdb_re      <= '0;                                 // no SRAM read driven
     end else begin
-      // D stage: accept a new beat from G, or drain the held one
+      // D stage: capture the word the async SRAM returns for A's in-flight read
       if (d_ready) begin                                 // D is free to update (empty or accepted)
-        d_valid <= g_fire;                               // hold a beat iff G issued one this cycle, else go empty (bubble)
-        if (g_fire) begin                                // latch the issued beat's control for next-cycle output
-          d_rid   <= rid_q;                              // request id
-          d_err   <= err_q;                              // error flag (SLVERR)
-          d_last  <= is_last;                            // whether this is the final beat (drives rlast)
-          d_ch    <= ch;                                 // channel -> picks which rdb_dout to slice next cycle
-          d_chunk <= chunk;                              // sub-beat within the packet -> which AXI_DW slice
-          d_slot  <= slot;                               // slot, kept so a stall can re-read the same word
+        d_valid <= a_valid;                              // hold a beat iff A had a read in flight, else bubble
+        if (a_valid) begin                               // slice the addressed channel's returned packet and register it
+          d_data <= a_err ? '0 : rdb_dout[a_ch][a_chunk*AXI_DW_L +: AXI_DW_L]; // chunk-th AXI_DW word (0 on error); narrow master extracts its lane
+          d_rid  <= a_rid;                               // request id
+          d_err  <= a_err;                               // error flag (SLVERR)
+          d_last <= a_last;                              // final-beat marker -> rlast
         end
       end
 
-      // G stage: advance the walk on each issued beat
-      if (g_fire) begin                                  // a beat was issued this cycle
+      // A stage: issue a read (register the address) when A is free; hold it while A stalls so
+      // the async SRAM output stays stable for D to capture.
+      if (a_ready) begin                                 // A is free to update (empty or captured by D)
+        a_valid <= g_fire;                               // a read goes in flight iff G issued one this cycle
+        rdb_re  <= '0;                                   // default: drive no read
+        if (g_fire) begin                                // register the issued beat's address + control
+          a_rid   <= rid_q;                              // request id
+          a_err   <= err_q;                              // error flag
+          a_last  <= is_last;                            // final beat?
+          a_ch    <= ch;                                 // channel, to select rdb_dout next cycle
+          a_chunk <= chunk;                              // sub-beat, to slice next cycle
+          if (~err_q) begin                              // real beat: drive the registered SRAM read
+            rdb_re[ch]   <= 1'b1;                         // read enable on this line's channel
+            rdb_addr[ch] <= slot;                         // at its slot
+          end
+        end
+      end
+
+      // G stage: advance the walk on each issued read
+      if (g_fire) begin                                  // a read was issued this cycle
         if (is_last) begin                               // it was the final beat of the burst
-          g_last_done <= 1'b1;                            // stop issuing; wait for D to drain the last beat
+          g_last_done <= 1'b1;                            // stop issuing; drain A then D
         end else begin
           beat_q <= beat_q + 8'd1;                        // next AXI beat index
           off_q  <= off_nxt[OFF_W_L-1:0];                 // advance in-line offset by 2^size

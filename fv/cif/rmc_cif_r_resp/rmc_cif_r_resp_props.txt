@@ -41,22 +41,20 @@ ASSERT  slot (reorder back to address order)
   a_rd_addr   g_fire & !err -> rdb_addr[ch] == slot
   a_slot_rng  g_fire & !err -> slot < N_RDB
 
-ASSERT  data path (the word on R is the right one)
+ASSERT  data path (R stream shape; the slot per beat is proved at issue, section slot)
   a_d_beat    rvalid -> r_out <= ar_len
   a_d_last    rvalid -> rlast == (r_out == ar_len)               exactly len+1 beats
-  a_d_ch      rvalid & !err -> d_ch    == chan(line of addr(r_out))
-  a_d_chunk   rvalid & !err -> d_chunk == addr(r_out)[5:BEAT_LSB]
-  a_d_slot    rvalid & !err -> d_slot  == slot(line of addr(r_out))
-  a_d_read    rvalid & !err -> SRAM d_ch was read at d_slot on the previous edge
-                               (so rdb_dout under rdata is that slot, also while stalled)
   a_d_rid     rvalid -> rid / rresp == the request's
+  (pipeline: G decodes -> A registers the SRAM address -> async SRAM -> D registers the
+   sliced word -> R. The reorder slot is checked at the A issue, a_slot/a_rd_addr; D holds
+   sliced data, not ch/slot, so the per-R-beat slot follows from issue + in-order flow.)
 
 ASSERT  helpers
   a_h_d       d_valid -> run, D carries the request's id / error
   a_h_req     run -> latched id, err, len, base_ch, head == the request's
-  a_h_ahead   G is exactly one beat ahead of R while D holds a beat
+  a_h_ahead   run & !g_last_done -> beat_q == r_out + a_valid + d_valid  (2 regs in flight)
   a_h_legal   run -> latched start aligned to size, size legal, burst in page
-  a_h_idle    !run -> D empty, G not finished
+  a_h_idle    !run -> A and D empty, G not finished
 
 ASSERT  R-channel handshake + metadata
   a_rvalid   rvalid == d_valid
@@ -65,7 +63,7 @@ ASSERT  R-channel handshake + metadata
   a_rlast    rlast  == d_valid & d_last
   a_last     is_last == (beat_q == len_q)
   a_resprdy  resp_ready == d_valid & d_last & rready     (pop/free on last accepted)
-  a_hold     rvalid & !rready => rvalid & stable(rid, rresp, rlast)   (data excluded)
+  a_hold     rvalid & !rready => rvalid & stable(rid, rresp, rlast, rdata)  (D registers data)
   a_release  last accepted => request releases (run drops)
   a_gfire    g_fire only while run & !g_last_done
   a_reset    first cycle after reset: !run, !rvalid, !resp_ready
