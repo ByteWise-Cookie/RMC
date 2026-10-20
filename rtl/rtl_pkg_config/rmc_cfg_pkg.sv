@@ -74,15 +74,14 @@ package rmc_cfg_pkg;
   parameter int PAGE_LSB  = 12;                          // log2(4 KB)
   parameter int PG_LINES  = 1 << (PAGE_LSB - PKT_OFF_W); // lines per page (64)
 
-  // ---- matched-bandwidth AXI width ----
-  // AXI_DW = N_DDR_CHANNELS * DDR_CHANNEL_WIDTH so the ingress (AXI write) rate
-  // equals the egress (DDR) rate -> WD/RD SRAM and ROB inflow/outflow stay balanced
-  // (inflow == outflow, no buffer blow-up).
-  // NOTE: BW = width * freq. This width-only form is exact ONLY if aclk == the DDR
-  // data rate. If aclk differs, scale: AXI_DW = N_CH*DDR_CHANNEL_W*(f_ddr/f_aclk),
-  // else AXI becomes the bottleneck and the buffers drift. (CLK_RATIO param TODO.)
+  // AXI data-path width
+  // AXI_DW = PKT_BYTES*8 = 64 B, so one AXI beat carries a whole 64 B line (one DRAM
+  // packet) and beat<->slot is 1:1 across CIF (no sub-beat chunks). The AXI side is then
+  // wider than the DRAM per-cycle rate (N_CH*DDR_CHANNEL_W); the WD/RD SRAMs and the ready
+  // back-pressure absorb the difference. DDR_CHANNEL_W is kept for the MC/DDR side (the
+  // earlier matched-per-cycle width was N_CH*DDR_CHANNEL_W).
   parameter int DDR_CHANNEL_W = 2 * DQ_W;                // per-channel data width (2 subch)
-  parameter int AXI_DW        = N_CH * DDR_CHANNEL_W;    // system AXI data width
+  parameter int AXI_DW        = PKT_BYTES * 8;           // system AXI data width = one 64 B line
 
   // ---- packet interleave / packets-per-bank (STAGE 24) ----
   // A request fans into packets; P_MAX = packets mapped to one bank (row-hit train).

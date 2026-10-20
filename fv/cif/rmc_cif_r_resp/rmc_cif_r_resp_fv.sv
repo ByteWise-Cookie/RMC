@@ -195,7 +195,13 @@ module rmc_cif_r_resp_fv #(
   wire [PAGE_LSB-1:0] g_addr = ref_addr(beat_q);
   `ASSERT(a_walk,  !run || {line_q, off_q} == g_addr);
   `ASSERT(a_size,  !run || size_q == r_size);
-  `ASSERT(a_chunk, !run || chunk == off_q[OFF_W-1:BEAT_LSB]);
+  // chunk = the sub-beat index, or a constant 0 when a beat is a whole packet (N_SUBB==1,
+  // BEAT_LSB==OFF_W), where off_q[OFF_W-1:BEAT_LSB] would be a null slice.
+  if (BEAT_LSB < OFF_W) begin : g_chunk_chk
+    `ASSERT(a_chunk, !run || chunk == off_q[OFF_W-1:BEAT_LSB]);
+  end else begin : g_chunk_chk0
+    `ASSERT(a_chunk, !run || chunk == '0);
+  end
   `ASSERT(a_beat_rng, !run || beat_q <= r_len);
 
   // 2. slot: channel and RD-SRAM slot of the beat G is issuing
