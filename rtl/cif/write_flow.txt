@@ -1,0 +1,122 @@
+WRITE PATH FLOW  (reference for coding; mirrors the read path, but in order)
+
+GOAL
+  Accept an AXI write (AW + W), store the W data, split the request into 64 B
+  DRAM write packets, issue them to the MC in order, and return one B response
+  per request when all its packets have completed. The write path is IN ORDER:
+  packets are issued in address order, no out-of-order burst splitting, no
+  seg_last. Up to N_OUTSTANDING requests may be admitted and buffered at once
+  (parameter; N_OUTSTANDING=1 is the simplest build), but issue stays in order.
+
+
+DATA WIDTH DECISION (applies to ALL of CIF, read and write)
+  AXI_DW = 64 B (512 b) is the standard CIF data-path width. One 64 B packet =
+  one AXI beat at full size, so beat<->slot is 1:1 and there are no sub-beat
+  chunks (N_SUBB = 1). This supersedes the earlier 128 b matched-BW width. It
+  means the AXI side is wider than the DRAM per-cycle rate, so the SRAMs buffer
+  and back-pressure absorb the difference (fine for both directions).
+  Knock-on: the read path's r_resp already handles N_SUBB==1 (chunk forced 0);
+  the splitter beat math and rmc_cfg_pkg AXI_DW must be set to 64 B, and the
+  "matched BW" memory note updated.
+  SRAM slot = PKT_BYTES = 64 B. Narrow writes (aw_size < 6) are the only
+  multi-beat-per-slot case and are handled by byte offset (see stage 2).
+
+
+STAGES
+
+1. AW admit
+   master AW -> AW channel -> validate (address ok, inside 4 KB, legal size;
+   top/bottom bound check only, NO RAW/WAR here) -> request FIFO -> w_rob admit.
+   The request FIFO decouples validate from admit (and from W-data arrival).
+   The ROB stores only what completion and the B response need:
+     { valid, aw_id, validated/err, n_pkts, len/size, base addr for the split }.
+   In order, so no per-channel head pointers and no seg_last; a ring of entries
+   plus a per-entry completion counter is enough (retire when cnt == n_pkts).
+   Admission capacity: up to N_OUTSTANDING entries live at once. Admit is gated
+   on ROB room (and WD-SRAM room), NOT on "splitter idle" - several requests can
+   be admitted while the splitter issues them one at a time in order. The
+   splitter owns awready the way the read splitter owns arready.
+
+2. W data capture + write_alloc (WD-SRAM fill)
+   W beats -> write_alloc -> WD-SRAM. Slots are 64 B. write_alloc stages beats in
+   address order, so storage is LINEAR: line k of the request is slot head+k, and
+   the channel is recovered later from the address, not from the slot index (no
+   per-channel partitioning - simpler than the read side).
+   write_alloc runs the SAME {line, off} walk as r_resp, inverted: r_resp reads a
+   slot and slices it to R beats; write_alloc takes an incoming W beat and places
+   it into a slot by byte offset.
+     in_slot_off(b) = (aw_addr + b*2^size)[5:0]        byte position inside the slot
+     slot(b)        = head + (aw_addr + b*2^size)[PAGE_LSB-1:6]
+     WD_SRAM[slot][in_slot_off +: 2^size] <= beat data
+     slot_strb[slot][in_slot_off +: 2^size] |= wstrb   accumulate the byte mask
+   - full size (aw_size == 6, 64 B/beat): one beat fills a slot, 1:1.
+   - narrow (aw_size < 6): 2^size bytes per beat land at their byte offset; the
+     slot accumulates over 2^(6-size) beats (fewer at an unaligned start/end).
+     Only the strobed bytes are written; un-strobed bytes keep mask 0 and are
+     masked at DRAM. The beat's wstrb is kept; narrow does NOT drop the strobe.
+   A slot is "filled" (ready to issue) when the walk steps out of it (off wraps)
+   or wlast ends the burst. write_alloc exposes to the splitter: the run base
+   (head_ptr) and a running count of filled slots.
+   Goal: pack tightly so WD-SRAM space is not wasted (write_alloc, WIP upstream).
+
+3. Burst splitter (in-order walk, reuses the read walk)
+   Same two-counter / walk_channel walk as r_resp, but it ISSUES write packets
+   and runs in order (no per-channel engines, no queue, no reorder). It has
+   latched base addr, len, size from the validator and computed n_pkts.
+   As write_alloc reports filled slots, for each line k in address order:
+     ch         = walk_channel(line k)        which DRAM channel
+     daddr      = addrmap(line k address)     DRAM coords (includes channel)
+     w_data_ptr = head + k                    WD-SRAM slot holding the data
+     tag        = rob_idx
+     wstrb      = slot_strb[w_data_ptr]       the 64 B byte mask for this packet
+   Build { op=write, rob_idx, daddr, w_data_ptr, wstrb }, push to the MC request
+   FIFO, decrement n_pkt. n_pkt==0 => this request fully issued; move to the next
+   admitted request (in order). The splitter waits on the filled count so it
+   never issues a packet whose W data has not landed.
+
+4. MC issue + completion + B response
+   The MC consumes the request FIFO, reads WD-SRAM[w_data_ptr], and writes DRAM
+   at daddr under wstrb (masked write; RMW only where the mask is partial). On
+   completion it pulses the completion channel with the rob_idx and a direction
+   bit = write. The demux steers it to w_rob. w_rob counts completions per entry;
+   at cnt == n_pkts it retires and the B assembler drives { bid, bresp, bvalid },
+   popping on bready. In order, so B leaves in admit order.
+
+
+OPEN / TO DECIDE BEFORE CODING
+  1. wstrb path. Carry a 64 B byte mask per WD-SRAM slot (slot_strb), fill it in
+     write_alloc, ship it in the packet, MC does the masked write. Decide the
+     mask storage: a parallel strobe SRAM/reg array indexed like WD-SRAM.
+  2. B response assembler. One B beat per retired request; bvalid/bready; bresp
+     carries the request's OKAY/SLVERR plus any packet completion error.
+  3. Completion demux. async_mc_cmpl needs an op/direction bit so write
+     completions hit w_rob, not r_rob (read/write rob_idx spaces overlap). Fix
+     before any mixed R/W sim.
+  4. N_OUTSTANDING sizing. ROB depth, request-FIFO depth, and WD-SRAM capacity
+     all scale with it. Define the parameter and the admit back-pressure that
+     keeps WD-SRAM from overflowing (admit only with a free run of slots).
+  5. W-vs-AW ordering. AXI4 W has no WID and follows AW order. Handle W before
+     AW; write_alloc must know which admitted request it is filling (tag the W
+     stream by admit order / the ROB index at the head of the W side).
+  6. RAW/WAR hazards. Validate does NOT handle them. The write path uses a
+     request-granular WAR stall; state where it lives (a hazard-check stage
+     between validate and admit, or deferred) - correctness for same-line
+     read/write ordering.
+  7. wlast cross-check. Filled count reaching n_pkts should coincide with wlast;
+     assert it, and define behaviour if the master's wlast/len disagree.
+
+
+RAW NOTE (original, for reference)
+  Goal: write flow same as read flow, but in order. wrob admits like r_rob but
+  no seg_last. W request fills a W_req FIFO first; w_rob admit is post-validate
+  (top/bottom only, no RAW/WAR), through a request fifo. Write into aw_id the
+  validated/err and what is needed; the rest goes to the burst splitter, which
+  controls an upstream write_alloc. write_alloc gives the splitter a head_ptr and
+  filled bit. Base addr + len + size are latched in the splitter; it computes
+  n_pkts == the slots write_alloc fills. When a wr_ptr + filled arrives the
+  splitter decrements n_pkt and makes a packet with the (offset) addr, the idx as
+  a tag, and the w_data_ptr, pushing to the FIFO, until the request is issued,
+  then the next. Support up to N outstanding IDs. Make 64 B the CIF data-path
+  width (drop the 128 b case). For a narrow write (e.g. aw_size 4 with an
+  unaligned start) stage each beat's bytes into the slot at its byte offset and
+  keep the strobe; ignore only the un-strobed bytes.
