@@ -113,10 +113,14 @@ module rmc_cif_r_burst_spltr #(
   // packets out, one stream per channel (from the engines)
   output logic [N_CH-1:0]                pkt_valid,         // packet offered on channel c
   input  logic [N_CH-1:0]                pkt_ready,         // channel c command FIFO accepts
-  input  logic [N_CH-1:0]                pkt_dbuf_adr_ready,// channel c RD-SRAM has a free slot
   output logic [N_CH-1:0][ROB_IDX_W-1:0] pkt_rob_idx,       // completion tag
   output logic [N_CH-1:0][DADDR_W-1:0]   pkt_daddr,         // DRAM coords of the line
   output logic [N_CH-1:0][SLOT_W-1:0]    pkt_dbuf_adr,      // RD-SRAM slot the line returns to
+
+  // RD-SRAM slot free: r_resp retires a request and releases each channel's run. Each
+  // engine owns its channel's slot ring (frptr), so the free just forwards to that engine.
+  input  logic [N_CH-1:0]                free_valid,
+  input  logic [N_CH-1:0][CNT_W-1:0]     free_burst,
 
   // split done -> ROB (writes ROB meta SRAM #2 at seg_rob_idx)
   output logic                           seg_last,          // oldest entry fully split (pulse)
@@ -293,10 +297,11 @@ module rmc_cif_r_burst_spltr #(
         .head_ptr           (eng_head[c]),
         .pkt_valid          (pkt_valid[c]),
         .pkt_ready          (pkt_ready[c]),
-        .pkt_dbuf_adr_ready (pkt_dbuf_adr_ready[c]),
         .pkt_rob_idx        (pkt_rob_idx[c]),
         .pkt_daddr          (pkt_daddr[c]),
         .pkt_dbuf_adr       (pkt_dbuf_adr[c]),
+        .free_valid         (free_valid[c]),
+        .free_burst         (free_burst[c]),
         .idle               (eng_idle[c])
       );
     end

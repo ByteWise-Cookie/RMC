@@ -82,10 +82,13 @@ module rmc_cif_r_burst_spltr_ch #(
   // packet out -> this channel's command FIFO
   output logic                           pkt_valid,         // packet offered
   input  logic                           pkt_ready,         // command FIFO accepts
-  input  logic                           pkt_dbuf_adr_ready,// RD-SRAM has a free slot
   output logic [ROB_IDX_W-1:0]           pkt_rob_idx,       // completion tag
   output logic [DADDR_W-1:0]             pkt_daddr,         // DRAM coords of the line
-  output logic [SLOT_W-1:0]              pkt_dbuf_adr,      // RD-SRAM slot (alloc pointer)
+  output logic [SLOT_W-1:0]              pkt_dbuf_adr,      // RD-SRAM slot (= frptr write pointer)
+
+  // RD-SRAM slot free: r_resp retires a request and releases this channel's run
+  input  logic                           free_valid,
+  input  logic [CNT_W-1:0]               free_burst,
 
   output logic                           idle               // not holding an unfinished entry
 );
@@ -94,10 +97,23 @@ module rmc_cif_r_burst_spltr_ch #(
   logic                  active;     // mid-entry: mine_reg holds the remaining lines
   logic [CNT_W-1:0]      m;          // packets already issued for the current entry
   logic [PG_LINES-1:0]   mine_reg;   // remaining lines for this channel (cleared as they fire)
-  logic [SLOT_W-1:0]     dbuf_ptr;   // this channel's RD-SRAM ring alloc pointer
   logic [QPTR_W-1:0]     rd_ptr_q;
 
   assign rd_ptr = rd_ptr_q;
+
+  // this channel's RD-SRAM slot ring: the alloc pointer (where the MC writes returned data /
+  // the slot this packet carries) advances on each fire; a request's run frees at r_resp
+  // retire. sram_ready gates issue so the ring never overruns unretired data.
+  logic [SLOT_W-1:0] dbuf_ptr;       // = frptr write_in_ptr (slot for this packet)
+  logic              slot_ready;     // = frptr sram_ready
+  rmc_cif_frptr #(.N_SLOTS (N_SLOTS)) u_frptr (
+    .aclk, .aresetn,
+    .write_in_ptr (dbuf_ptr),
+    .sram_ready   (slot_ready),
+    .alloc        (fire),
+    .free_valid   (free_valid),
+    .free_burst   (free_burst)
+  );
 
   // Lowest set bit index of a 64-line mask (scan high->low so the lowest index wins).
   function automatic logic [LN_W-1:0] ffs(input logic [PG_LINES-1:0] v);
@@ -130,7 +146,7 @@ module rmc_cif_r_burst_spltr_ch #(
   assign owes      = entry_valid & ~e_ch_done;
   assign first     = ~active;                       // m == 0
   assign m_eff     = active ? m : '0;
-  assign pkt_valid = owes & pkt_dbuf_adr_ready;
+  assign pkt_valid = owes & slot_ready;
   assign fire      = pkt_valid & pkt_ready;
   assign last      = owes & (m_eff == e_ch_pkts - CNT_W'(1));
   assign skip      = entry_valid & e_ch_done & ~active;
@@ -160,12 +176,8 @@ module rmc_cif_r_burst_spltr_ch #(
       rd_ptr_q <= '0;
       active   <= 1'b0;
       m        <= '0;
-      dbuf_ptr <= '0;
       mine_reg <= '0;
     end else begin
-      if (fire)
-        dbuf_ptr <= (dbuf_ptr == SLOT_W'(N_SLOTS-1)) ? '0 : dbuf_ptr + 1'b1;
-
       if (skip) begin
         rd_ptr_q <= rd_ptr_q + 1'b1;         // nothing for us: step over at 1/cycle
       end else if (fire) begin

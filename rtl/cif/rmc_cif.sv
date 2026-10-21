@@ -246,10 +246,14 @@ module rmc_cif #(
     .admit_ch_mask  (ar_admit_ch_mask),
     .pkt_valid      (/* TODO: per-channel req FIFO */),
     .pkt_ready      ({N_CH{1'b0}}),            // TODO: from the per-channel req FIFO
-    .pkt_dbuf_adr_ready ({N_CH{1'b1}}),        // TODO: from RD-SRAM allocator (slot availability)
     .pkt_rob_idx    (/* TODO */),
     .pkt_daddr      (/* TODO */),
     .pkt_dbuf_adr   (/* TODO */),
+    // RD-SRAM slot free from r_resp retire. TODO: drive free_valid = r_resp retire pulse and
+    // free_burst[c] = that request's line count on channel c (r_resp knows it from its walk).
+    // Harmless at 0 for now: pkt_ready is tied 0 so no slot is ever allocated.
+    .free_valid     ({N_CH{1'b0}}),
+    .free_burst     ('0),
     .seg_last       (ar_seg_last),
     .seg_rob_idx    (ar_seg_rob_idx),
     .seg_head_ptr   (ar_seg_head_ptr),
