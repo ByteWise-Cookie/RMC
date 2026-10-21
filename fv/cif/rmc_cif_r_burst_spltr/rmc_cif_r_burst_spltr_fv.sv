@@ -10,7 +10,7 @@
 //                     slot + a free ROB slot; the ring never overflows.
 //   3. head pop      : seg_last fires exactly when the oldest live entry has every channel
 //                     done, carries that entry's rob_idx, and pops in admit order.
-// The engines run inside the DUT with pkt_ready / pkt_dbuf_adr_ready left free, so the
+// The engines run inside the DUT with pkt_ready / the slot ring left free, so the
 // proof holds for any back-pressure. Liveness (every admit eventually pops) needs a
 // fairness assumption on those and is left as future work (see props NOT DONE).
 //
@@ -275,7 +275,11 @@ module rmc_cif_r_burst_spltr_fv #(
 
   wire [N_CH-1:0] pv   = rmc_cif_r_burst_spltr.pkt_valid;
   wire [N_CH-1:0] prdy = rmc_cif_r_burst_spltr.pkt_ready;
-  wire [N_CH-1:0] drdy = rmc_cif_r_burst_spltr.pkt_dbuf_adr_ready;
+  // slot-ready is now internal to each engine's frptr (was the pkt_dbuf_adr_ready port)
+  wire [N_CH-1:0] drdy;
+  for (genvar c = 0; c < N_CH; c++) begin : g_drdy
+    assign drdy[c] = rmc_cif_r_burst_spltr.g_eng[c].u_ch.slot_ready;
+  end
   wire [N_CH-1:0] fire = pv & prdy;
 
   // byte address of page line i of the watched request, and its channel / DRAM coords
@@ -405,6 +409,14 @@ module rmc_cif_r_burst_spltr_fv #(
   // PAGE_LSB, else from base_ch (bits at or above PAGE_LSB are constant in the page).
   // Checked at admit, for every line of the page, against the full-address decode.
   // ------------------------------------------------------------------------
+  // helper: the S1 register holds the stage-1 decode of the request it holds (the map is
+  // static, so the registered per-line channels and bounds match s1_addr)
+  for (genvar i = 0; i < PG_LINES; i++) begin : g_s1
+    `ASSERT(a_h_s1_ch, !s1_valid || rmc_cif_r_burst_spltr.s1_line_ch_v[i]
+                       == exp_dec(ref_line_byte(LN_W'(i)))[PKT_OFF_W +: CH_W]);
+  end
+  `ASSERT(a_h_s1_lb, !s1_valid || (rmc_cif_r_burst_spltr.s1_L0 == ref_l0_b
+                                 && rmc_cif_r_burst_spltr.s1_L_last == ref_llast_b));
   // base_ch is the channel of the request's first line
   `ASSERT(a_base_ch, !admit || admit_base_ch == exp_dec(ref_line_byte(ref_l0_b))[PKT_OFF_W +: CH_W]);
   for (genvar i = 0; i < PG_LINES; i++) begin : g_rebuild
