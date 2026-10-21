@@ -18,15 +18,24 @@ module rmc_cif #(
   // client AXI4
   parameter int AXI_IDW   = 8,
   parameter int AXI_AW    = 48,        // map needs >=41 (row ends at bit 40)
-  // AXI_DW is NOT a free param: it is rmc_cfg_pkg::AXI_DW = N_CH*DDR_CHANNEL_W
-  // (matched BW, inflow==outflow). Imported below; do not override per-instance.
+  // AXI_DW is NOT a free param: it is rmc_cfg_pkg::AXI_DW = PKT_BYTES*8 = 64 B (one line
+  // per AXI beat). Imported below; do not override per-instance.
   // reorder buffer / packetization
-  parameter int ROB_DEPTH = 32,        // physical ROB entries (16-32)   [root knob]
+  parameter int ROB_DEPTH = 32,        // physical ROB entries = max outstanding requests per
+                                       // direction (N_OUTSTANDING). Bigger = more AW/AR in
+                                       // flight (more admits before stalling) at the cost of
+                                       // entry flops; it also sets how many requests' slot
+                                       // runs can coexist in the WD/RD rings, so N_WDB/N_RDB
+                                       // must cover it (see below).            [root knob]
   parameter int MAX_PKTS  = MAX_REQ_PKTS, // lines per request: 4KB / 64B = 64 [root knob]
-  // data buffers (client-side ports; SRAM may be instanced at MC top)
-  parameter int N_WDB     = 32,        // WD_SRAM slots
-  parameter int N_RDB     = 64,        // RD_SRAM slots per channel (>= MAX_PKTS: one request
-                                       // can land all its lines on one channel)
+  // data buffers, PER CHANNEL (client-side ports; SRAM may be instanced at MC top). Each is
+  // a per-channel ring; a request frees its whole run only at retire (in order). Must be
+  // >= MAX_PKTS so a single request whose lines all land on one channel still fits - a
+  // smaller ring DEADLOCKS that request (it can never allocate its full run). Larger than
+  // MAX_PKTS lets several outstanding requests' runs coexist in a channel (more write/read
+  // throughput before admit stalls on a full ring).
+  parameter int N_WDB     = 64,        // WD_SRAM slots per channel (>= MAX_PKTS)
+  parameter int N_RDB     = 64,        // RD_SRAM slots per channel (>= MAX_PKTS)
 
   // derived widths (localparam: not overridable, visible to port list)
   localparam int SRAM_W    = PKT_BYTES * 8,   // one 64B packet per line (= BL*DQ_W)
@@ -96,6 +105,7 @@ module rmc_cif #(
   // (blocking a done-signal deadlocks the round trip). Only drop on soft-reset drain.
   input  logic [ROB_IDX_W-1:0]   async_mc_cmpl_rob_index,  // completion = pulse + this
   input  logic                   async_mc_cmpl_op,         // 0 = read (-> r_rob), 1 = write (-> w_rob)
+  input  logic                   async_mc_cmpl_err,        // downstream error on this packet -> SLVERR
 
   // WD_SRAM client-side write port, one per channel (CIF/write_alloc writes; MC reads).
   // Per-channel: a line's data lives in its channel's WD-SRAM, symmetric to rdb_*.
@@ -284,6 +294,7 @@ module rmc_cif #(
     .aresetn        (aresetn),
     .cmpl_valid     (cmpl_rd),
     .cmpl_rob_index (async_mc_cmpl_rob_index),
+    .cmpl_err       (async_mc_cmpl_err),
     .AW_REQUEST     ({ar_admit_id, ar_admit_validated}),
     .ADMIT_NPKTS    (ar_admit_npkts),
     .ADMIT_ADDR_LO  (ar_admit_addr_lo),
@@ -348,7 +359,7 @@ module rmc_cif #(
     .aresetn        (aresetn),
     .cmpl_valid     (cmpl_wr),
     .cmpl_rob_index (async_mc_cmpl_rob_index),
-    .cmpl_err       (1'b0),                   // TODO: carry a cmpl error bit from the MC
+    .cmpl_err       (async_mc_cmpl_err),
     .AW_REQUEST     ({awid, awlen, awsize, aw_ok}),
     .A_ID_VALID     (awvalid),
     .A_ID_READY     (awready),
