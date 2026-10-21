@@ -164,19 +164,21 @@ module rmc_cif #(
   rmc_cif_reqvalidator #(.AXI_AW(AXI_AW)) u_val_ar (
     .req_addr (araddr), .req_len (arlen), .req_size (arsize), .req_ok (ar_ok));
 
-  // READ PATH LEFT TO DO (rseg/rrob control is wired; these remain):
-  //   - req_dbuf_base: the RD-SRAM slot allocator is not built; u_rseg's
-  //     req_dbuf_base is stubbed. Allocate a contiguous RD-SRAM base per
-  //     admitted read and feed it here.
+  // READ PATH LEFT TO DO (rseg/rrob control + the RD-SRAM slot ring are wired; these remain):
+  //   - RD-SRAM free: wire u_rseg.free_valid / free_burst[N_CH] from u_r_resp retire.
+  //     On the last accepted beat of a request (resp_ready), r_resp releases each channel's
+  //     run: free_valid = that pulse, free_burst[c] = the request's line count on channel c
+  //     (r_resp knows it from its walk). Tied 0 now, which is safe only while pkt_ready is 0
+  //     (nothing allocates); must be driven before reads actually flow or the frptr rings
+  //     fill and stall.
   //   - pkt_* -> MC: u_rseg emits N_CH per-channel packet streams, but this
   //     block has a single async_mc_req_* port. Add per-channel req FIFOs +
   //     an N_CH->1 arbiter (or widen the MC req interface to per-channel).
-  //   - dbuf addressing: global dbuf_base+k (per-channel SRAM sparse) vs a
-  //     packed per-channel index - open; affects RD-SRAM size + resp readback.
   //   - scattered-map fallback: rseg assumes the contract map (ch = low CH_W
   //     line bits); an arbitrary CSR map needs the scan path (not built).
-  // RESP_* -> R channel is now wired through u_r_resp (per-channel RD-SRAM read,
-  // window-mux channel recovery, full-width INCR; narrow-burst trim still TODO).
+  // RESP_* -> R channel is wired through u_r_resp (per-channel RD-SRAM read, window-mux
+  // channel recovery, full-width INCR; narrow-burst trim still TODO). The per-channel slot
+  // ring (alloc + free + not-full) now lives in each engine's rmc_cif_frptr.
 
   // read splitter <-> read ROB handoff nets. Splitter-side widths for ar_len/ar_size and
   // cfg_n_ch_log2 (mirror the splitter's own derivation so the port connections match).
