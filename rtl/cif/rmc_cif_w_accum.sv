@@ -8,7 +8,40 @@
 // channel; wready to the master is gated by w_ready[ch] (room) from the frptr blocks.
 // Handshake: filled (a line is staged) out <-> ch_in_valid (splitter consumed it) in.
 //
-// STUB: ports fixed; the W-beat staging / narrow packing and the SRAM write are TODO.
+// HOW IT WORKS
+// One 64 B line is assembled at a time in a line buffer {data[64B], strobe[64b]}. Each W beat
+// is merged in at its in-line byte offset, and the MASK is generated purely from the
+// accumulated wstrb over the 64 B packet - NOT from aw_size. aw_size only paces the address
+// (how many beats and where each byte lands); wstrb says which bytes are valid, so the write
+// is a byte-masked DRAM write (no read-modify-write).
+//
+//   off  = (aw_addr + beat*2^size)[5:0]            byte position in the 64 B line
+//   for each byte b with wstrb[b]: data[off..][b] <= wdata[b]
+//   strobe |= wstrb (at those byte positions)
+// AXI_DW is 64 B, so each beat's wstrb is already line-wide and this is a straight merge/OR.
+// When the line is done (the byte position wraps past 64 B, or wlast) the buffer is written to
+// WD-SRAM at the frptr's write_in_ptr[ch] (ch asserted by the splitter) and `filled` pulses.
+//
+// EXAMPLES
+//  a) full ALIGNED 64 B write (aw_size = 6 AND start offset == 0): one beat per line,
+//        wstrb = {64{1}} -> strobe = {64{1}}, whole line written, commit on wlast. Every
+//        line of such a burst is fully written.
+//  b) narrow burst, 4 x 1 B (aw_size = 0), starting at in-line offset 4 (several beats pack
+//        into ONE line):
+//        beat0 off=4 -> data[4]=B0 ; beat1 off=5 -> data[5]=B1 ;
+//        beat2 off=6 -> data[6]=B2 ; beat3 off=7 -> data[7]=B3 (+ wlast)
+//        => one packet: strobe = ...0000_1111_0000 (bytes 4..7 set) ; data = ..B0 B1 B2 B3..
+//           only those 4 DRAM bytes are written; the rest masked off.
+//  c) full-size UNALIGNED burst (aw_size = 6, start offset != 0, one beat per line, N lines):
+//        FIRST line  : masked at the FRONT  - wstrb sets [off..63], bytes 0..off-1 masked.
+//        MIDDLE lines : FULL - wstrb = {64{1}} (must be all 1s; anything less is a bug).
+//        LAST line   : masked at the BACK   - wstrb sets [0..end], bytes end+1..63 masked.
+//        The accumulator just stores each beat's own wstrb, so this pattern falls out of the
+//        master's strobes; the accumulator never pulls a middle line's mask down.
+//  d) a long NARROW burst spanning several lines: the byte position wraps every 64 B, so each
+//     line commits on its own wrap; the final (partial) line commits on wlast with its mask.
+//
+// STUB: ports fixed; the beat merge / line commit / mask generation are TODO (this comment).
 
 import rmc_cfg_pkg::*;
 
