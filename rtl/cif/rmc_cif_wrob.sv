@@ -43,7 +43,7 @@ module rmc_cif_wrob #(
   output logic [ROB_IDX_W-1:0]   ROB_IDX,          // offered slot index (= alloc_ptr)
   input  logic                   SEG_LAST,         // last packet issued
   input  logic [CNT_W-1:0]       SEG_NPKTS,        // total packet count (= completion target)
-  // per-channel WD-SRAM run descriptor from wseg (latched at SEG_LAST): each channel's
+  // per-channel WD-SRAM run descriptor from the splitter (latched at SEG_LAST): each channel's
   // first slot and how many slots it holds. Read at retire to free each run.
   input  logic [N_CH-1:0][SLOT_W-1:0] SEG_HEAD_PTR, // each channel's first slot
   input  logic [N_CH-1:0][CNT_W-1:0]  SEG_NPKTS_CH, // each channel's slot count

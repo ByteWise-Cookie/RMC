@@ -1,22 +1,28 @@
-// rmc_cif_wseg.sv
-// WRITE burst segmenter. Splits one admitted write request into 64B-line packets,
-// one CAS each, and streams them to MC via the per-channel req async FIFOs; pulses
-// SEG_LAST + SEG_NPKTS back to w_rob to close inflow.
+// rmc_cif_w_burst_spltr.sv
+// WRITE burst splitter (twin of rmc_cif_r_burst_spltr, but in order and issuing writes).
+// Pure control: it moves no data and owns no slot pointers. For one admitted write
+// request it walks the 64B lines in address order and emits one DRAM write command per
+// line, then hands w_rob the per-channel run descriptor.
 //
-// Differs from the read seg ONLY in the slot engine: write packets take slots from
-// the WD-SRAM manager's FREE-LIST (scattered), not a contiguous base, so each packet
-// pulls a free slot and the packets form a LINKED CHAIN (next_ram[slot]); w_rob /
-// the accumulator track {head, tail}. There is no read-meta sideband. Write masking
-// (unaligned/narrow) rides as WSTRB with the data, so only packet_narrow is flagged.
+// Per line, paced by the write accumulator's `filled` pulse (the line's data is staged):
+//   ch    = walk_channel(line)                  which DRAM channel (asserted to the alloc)
+//   daddr = addrmap(line address)               DRAM coords
+//   slot  = head_ptr[ch]   (from the SRAM manager, fanned to the accumulator too)
+//   emit  { op=write, rob_idx, ch, daddr, slot, wstrb } -> MC request FIFO
+//   pulse alloc[ch]        -> SRAM manager advances head_ptr[ch]
+//   bookkeep: first hit of ch records head_ptr[ch] as that channel's run base;
+//             cnt[ch]++ ; n_pkt--.
+// At n_pkt==0: drive SEG_LAST + SEG_NPKTS (total) + SEG_HEAD_PTR[N_CH] + SEG_NPKTS_CH[N_CH]
+// to w_rob, then take the next admitted request. Narrow/unaligned masking rides as wstrb.
 //
-// The split MATH (n_pkts = ceil(span/64), per-cycle N_CH window, channel walk,
-// pkt_num, per-packet daddr via rmc_cif_addrmap) is identical to rmc_cif_r_burst_spltr.
+// The walk is the same {line,off} + walk_channel as rmc_cif_r_resp. The WD-SRAM write and
+// the per-channel ring pointers live in the accumulator and the SRAM manager, not here.
 //
-// STUB: ports + the write slot/chain engine are TODO. Split math to mirror rseg.
+// STUB: ports + the walk are TODO, built against the accumulator / SRAM manager stubs.
 
 import rmc_cfg_pkg::*;
 
-module rmc_cif_wseg #(
+module rmc_cif_w_burst_spltr #(
   parameter int ROB_DEPTH = 32,         // ROB entries             [root knob]
   parameter int MAX_PKTS  = 64,         // max packets per request [root knob]
   parameter int AXI_AW    = SYS_ADDR_W, // AXI address width       [root knob]
@@ -92,4 +98,4 @@ module rmc_cif_wseg #(
   assign packet_offset      = '0;
   assign packet_narrow      = '0;
 
-endmodule : rmc_cif_wseg
+endmodule : rmc_cif_w_burst_spltr

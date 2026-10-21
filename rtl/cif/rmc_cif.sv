@@ -246,11 +246,12 @@ module rmc_cif #(
     .idle           (/* TODO */)
   );
 
-  // write segmenter - still a stub. TODO: mirror rseg (ring + per-channel engines) with
-  // free-list slots + chain; wire to u_wrob and the W/AW path.
-  rmc_cif_wseg #(
+  // write burst splitter - still a stub. In-order walk (twin of rmc_cif_r_burst_spltr):
+  // per line compute ch/daddr, slot = head_ptr[ch] from the SRAM manager, emit the write
+  // packet, and hand u_wrob the per-channel run descriptor at SEG_LAST.
+  rmc_cif_w_burst_spltr #(
     .ROB_DEPTH (ROB_DEPTH), .MAX_PKTS (MAX_PKTS), .AXI_AW (AXI_AW)
-  ) u_wseg (
+  ) u_w_burst_spltr (
     .aclk (aclk), .aresetn (aresetn)
   );
 
@@ -351,8 +352,8 @@ module rmc_cif #(
     .AW_REQUEST     ({awid, awlen, awsize, aw_ok}),
     .A_ID_VALID     (awvalid),
     .A_ID_READY     (awready),
-    // SEG_* from u_wseg (not built yet) - tied off so nothing retires until writes flow
-    .ROB_IDX        (/* TODO: -> u_wseg */),
+    // SEG_* from u_w_burst_spltr (not built yet) - tied off so nothing retires until writes flow
+    .ROB_IDX        (/* TODO: -> u_w_burst_spltr */),
     .SEG_LAST       (1'b0),
     .SEG_NPKTS      ('0),
     .SEG_HEAD_PTR   ('0),
@@ -366,7 +367,7 @@ module rmc_cif #(
     .RESP_NPKTS_CH  (/* TODO: -> write accumulator free */)
   );
 
-  // request builder stubs (TODO: fed by u_wseg once the write issue path is built)
+  // request builder stubs (TODO: fed by u_w_burst_spltr once the write issue path is built)
   assign async_mc_req_valid       = 1'b0;
   assign async_mc_req_rob_index   = '0;
   assign async_mc_req_op          = 1'b0;
