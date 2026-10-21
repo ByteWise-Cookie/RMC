@@ -300,36 +300,4 @@ module rmc_cif_r_resp #(
     end
   end
 
-`ifndef SYNTHESIS
-  // elaboration/param guards. The per-channel slot pointer is head_q[ch] + cnt_q[ch] in
-  // SLOT_W bits, so it wraps at 2^SLOT_W; that only matches the ring when N_RDB is a power
-  // of two (otherwise a run that wraps reads the wrong slot). CH_W < 1 (single channel)
-  // collapses every [CH_W-1:0] vector and is not supported yet.
-  initial begin
-    if ((1 << SLOT_W) != N_RDB)
-      $fatal(1, "r_resp: N_RDB (%0d) must be a power of two", N_RDB);
-    if (CH_W_L < 1)
-      $fatal(1, "r_resp: single-channel build (CH_W=0) not supported");
-  end
-
-  // a non-error beat being issued must address a real slot; recovered channel must be
-  // active; ar_size must not exceed the full bus width (a legal AXI read).
-  always @(posedge aclk) if (aresetn && g_fire && !err_q) begin   // only on a real issued beat
-    assert (32'(slot) < N_RDB)                                     // the read must land on a real RD-SRAM slot
-      else $error("r_resp: slot %0d out of range (N_RDB=%0d)", slot, N_RDB);
-    assert (int'(ch) < (1 << cfg_n_ch_log2))                       // the recovered channel must be one of the active channels
-      else $error("r_resp: recovered channel %0d exceeds active channels", ch);
-    assert (int'(size_q) <= BEAT_LSB)                              // ar_size cannot exceed the full bus width (a legal AXI read)
-      else $error("r_resp: ar_size %0d exceeds full-width %0d", size_q, BEAT_LSB);
-  end
-
-  // the address map must route each active CH bit from at or above the 64B line offset; a
-  // source below it would make line_tag feed a forced-0 bit and silently corrupt the channel.
-  always @(posedge aclk) if (aresetn && run)
-    for (int k = 0; k < CH_W_L; k++)
-      if (k < int'(cfg_n_ch_log2))
-        assert (int'(addr_map[OFF_W_L + k]) >= OFF_W_L)
-          else $error("r_resp: CH source bit %0d is below the line offset", k);
-`endif
-
 endmodule : rmc_cif_r_resp

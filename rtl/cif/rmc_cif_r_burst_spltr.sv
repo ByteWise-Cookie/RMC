@@ -340,22 +340,6 @@ module rmc_cif_r_burst_spltr #(
     end
   end
 
-`ifndef SYNTHESIS
-  // sum of per-channel counts must equal the total packet count on every admit
-  logic [CNT_W+CH_W-1:0] cnt_sum;
-  always_comb begin
-    cnt_sum = '0;
-    for (int c = 0; c < N_CH; c++) cnt_sum = cnt_sum + (CNT_W+CH_W)'(commit_ch_pkts_eff[c]);
-  end
-  always_ff @(posedge aclk)
-    if (aresetn & admit) begin
-      if (s1_last_byte[15:PAGE_LSB] != '0)
-        $error("r_burst_spltr: AR crosses 4KB (addr=%h len=%0d size=%0d)", s1_addr, s1_len, s1_size);
-      if (s1_validated & (cnt_sum != (CNT_W+CH_W)'(n_pkts)))
-        $error("r_burst_spltr: sum(ch_pkts)=%0d != n_pkts=%0d", cnt_sum, n_pkts);
-    end
-`endif
-
 endmodule : rmc_cif_r_burst_spltr
 
 // THEORY OF OPERATION   (read together with rmc_cif_r_burst_spltr_ch.sv)

@@ -10,10 +10,10 @@
 //   slot  = write_in_ptr[ch]  (from the frptr block, the same value the accumulator writes at)
 //   emit  packet_*[ch] = { rob_idx, daddr, slot } -> MC request FIFO (op=write; mask in SRAM)
 //   pulse alloc[ch]        -> frptr advances write_in_ptr[ch]
-//   bookkeep: first hit of ch records write_in_ptr[ch] as that channel's run base;
-//             cnt[ch]++ ; one line fewer to go.
-// At the last line: drive SEG_LAST + SEG_NPKTS (total) + SEG_HEAD_PTR[N_CH] + SEG_NPKTS_CH[N_CH]
-// to w_rob, then capture the next admitted request. Narrow/unaligned masking rides as the
+//   bookkeep: cnt[ch]++ ; one line fewer to go.
+// At the last line: drive SEG_LAST + SEG_NPKTS (total) + SEG_NPKTS_CH[N_CH] to w_rob (the
+// per-channel counts free each ring at retire; the base is implicit, in-order), then capture
+// the next admitted request. Narrow/unaligned masking rides as the
 // per-slot wstrb the accumulator stored in WD-SRAM, not in the packet.
 //
 // The accumulator and the splitter step in lockstep on line order (W beats arrive in AW
@@ -57,10 +57,9 @@ module rmc_cif_w_burst_spltr #(
   output logic [CH_W-1:0]        ch,
   output logic                   ch_valid,
 
-  // back to w_rob when the split finishes: total count + per-channel run descriptor
+  // back to w_rob when the split finishes: total count + per-channel slot count (for the free)
   output logic                   SEG_LAST,
   output logic [CNT_W-1:0]       SEG_NPKTS,
-  output logic [N_CH-1:0][SLOT_W-1:0] SEG_HEAD_PTR,  // each channel's first slot (run base)
   output logic [N_CH-1:0][CNT_W-1:0]  SEG_NPKTS_CH,  // each channel's slot count
 
   // MC write packet stream, ONE PER CHANNEL (mask rides in WD-SRAM, not the packet)
@@ -74,16 +73,12 @@ module rmc_cif_w_burst_spltr #(
   // walk state for the one request being split
   logic                 run;
   logic [AXI_AW-1:0]    s_addr;
-  logic [2:0]           s_size;
   logic [ROB_IDX_W-1:0] s_rob;
   logic [LINE_W-1:0]    line_q;        // current in-page line index
-  logic [LINE_W-1:0]    l_last;        // last line of the request
   logic [CNT_W-1:0]     n_left;        // lines still to issue
 
-  // per-channel run bookkeeping (recorded during the walk, shipped at SEG_LAST)
-  logic [N_CH-1:0][SLOT_W-1:0] head_q;
+  // per-channel line count (recorded during the walk, shipped at SEG_LAST for the free)
   logic [N_CH-1:0][CNT_W-1:0]  cnt_q;
-  logic [N_CH-1:0]             seen_q;
 
   // bounds of an incoming request (combinational, used at capture)
   logic [PAGE_LSB-1:0] size_mask, a_al;
@@ -139,45 +134,33 @@ module rmc_cif_w_burst_spltr #(
   assign ch       = w_ch;
   assign ch_valid = fire;
 
-  // SEG_* to w_rob at the last accepted line, with the final per-channel counts/bases
-  logic [N_CH-1:0][SLOT_W-1:0] head_final;
-  logic [N_CH-1:0][CNT_W-1:0]  cnt_final;
-  always_comb
-    for (int c = 0; c < N_CH; c++) begin
-      cnt_final[c]  = cnt_q[c]  + ((fire && w_ch == CH_W'(c)) ? CNT_W'(1) : '0);
-      head_final[c] = (seen_q[c] || !(fire && w_ch == CH_W'(c))) ? head_q[c]
-                                                                 : write_in_ptr[c];
-    end
-  logic [CNT_W-1:0] npkts_sum;
+  // SEG_* to w_rob at the last accepted line, with the final per-channel counts
+  logic [N_CH-1:0][CNT_W-1:0] cnt_final;
+  logic [CNT_W-1:0]           npkts_sum;
   always_comb begin
     npkts_sum = '0;
-    for (int c = 0; c < N_CH; c++) npkts_sum = npkts_sum + cnt_final[c];
+    for (int c = 0; c < N_CH; c++) begin
+      cnt_final[c] = cnt_q[c] + ((fire && w_ch == CH_W'(c)) ? CNT_W'(1) : '0);
+      npkts_sum    = npkts_sum + cnt_final[c];
+    end
   end
   assign SEG_LAST     = fire & is_last;
   assign SEG_NPKTS    = SEG_LAST ? npkts_sum : '0;
-  assign SEG_HEAD_PTR = head_final;
   assign SEG_NPKTS_CH = cnt_final;
 
   always_ff @(posedge aclk or negedge aresetn) begin
     if (!aresetn) begin
-      run    <= 1'b0;
-      seen_q <= '0;
-      cnt_q  <= '0;
+      run   <= 1'b0;
+      cnt_q <= '0;
     end else if (capture) begin
       run    <= 1'b1;
       s_addr <= req_in_addr;
-      s_size <= req_in_size;
       s_rob  <= req_in_rob_idx;
       line_q <= cap_l0;
-      l_last <= cap_llast;
       n_left <= cap_npkts;
-      seen_q <= '0;
       cnt_q  <= '0;
     end else if (fire) begin
-      // record this channel's run base on its first hit, bump its count
-      if (!seen_q[w_ch]) head_q[w_ch] <= write_in_ptr[w_ch];
-      seen_q[w_ch] <= 1'b1;
-      cnt_q[w_ch]  <= cnt_q[w_ch] + CNT_W'(1);
+      cnt_q[w_ch] <= cnt_q[w_ch] + CNT_W'(1);   // one more line on this channel
       if (is_last) run <= 1'b0;                 // request fully issued
       else begin
         line_q <= line_q + 1'b1;
@@ -185,13 +168,5 @@ module rmc_cif_w_burst_spltr #(
       end
     end
   end
-
-`ifndef SYNTHESIS
-  // the request must stay inside its 4KB page (no line index carry out)
-  always @(posedge aclk) if (aresetn && capture)
-    assert (last_byte[15:PAGE_LSB] == '0)
-      else $error("w_burst_spltr: AW crosses 4KB (addr=%h len=%0d size=%0d)",
-                  req_in_addr, req_in_len, req_in_size);
-`endif
 
 endmodule : rmc_cif_w_burst_spltr

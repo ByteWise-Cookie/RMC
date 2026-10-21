@@ -4,9 +4,9 @@
 //
 // Same ring / admit / completion-count / retire core as rmc_cif_rrob. Differences:
 //   - response is B only: RESP_ID + RESP_RESP (BRESP). No read extras.
-//   - the per-slot metadata is the per-channel WD-SRAM run base: SEG_HEAD_PTR[N_CH]
-//     latched at SEG_LAST, read out at retire so the accumulator can free each
-//     channel's whole run (linear per-channel rings, Option B free).
+//   - the per-slot metadata is the per-channel WD-SRAM run length SEG_NPKTS_CH[N_CH]
+//     latched at SEG_LAST, read out at retire so the accumulator's frptr frees each
+//     channel's run (count slots off the ring tail; in-order, so the base is implicit).
 //
 // Slot ring: alloc_ptr advances on SEG_LAST, retire_ptr on retire, occ = fill.
 // Completion is a pulse {rob_index, err}; outflow up-counts to n_pkts.
@@ -43,18 +43,16 @@ module rmc_cif_wrob #(
   output logic [ROB_IDX_W-1:0]   ROB_IDX,          // offered slot index (= alloc_ptr)
   input  logic                   SEG_LAST,         // last packet issued
   input  logic [CNT_W-1:0]       SEG_NPKTS,        // total packet count (= completion target)
-  // per-channel WD-SRAM run descriptor from the splitter (latched at SEG_LAST): each channel's
-  // first slot and how many slots it holds. Read at retire to free each run.
-  input  logic [N_CH-1:0][SLOT_W-1:0] SEG_HEAD_PTR, // each channel's first slot
-  input  logic [N_CH-1:0][CNT_W-1:0]  SEG_NPKTS_CH, // each channel's slot count
+  // per-channel slot count from the splitter (latched at SEG_LAST). In-order free, so only
+  // the count is needed to release each channel's run at retire (the run is the ring tail).
+  input  logic [N_CH-1:0][CNT_W-1:0]  SEG_NPKTS_CH,
 
   // retire / B response
   output logic                   RESP_VALID,
   input  logic                   RESP_READY,
   output logic [AXI_IDW-1:0]     RESP_ID,
   output logic [1:0]             RESP_RESP,        // 00 OKAY / 10 SLVERR
-  // per-channel run to free at retire (head + count), handed to the write accumulator
-  output logic [N_CH-1:0][SLOT_W-1:0] RESP_HEAD_PTR,
+  // per-channel run length to free at retire, handed to the write accumulator's frptr
   output logic [N_CH-1:0][CNT_W-1:0]  RESP_NPKTS_CH
 );
 
@@ -95,17 +93,12 @@ module rmc_cif_wrob #(
   assign RESP_RESP  = (ent_err[retire_ptr] | ent_derr[retire_ptr]) ? 2'b10 : 2'b00;
   wire retire_fire  = RESP_VALID & RESP_READY;
 
-  // per-channel run descriptor store: {head, count} latched at SEG_LAST, read at retire so
-  // the accumulator frees each channel's whole run (head..head+count) in one go.
-  logic [N_CH-1:0][SLOT_W-1:0] run_head [ROB_DEPTH];
-  logic [N_CH-1:0][CNT_W-1:0]  run_cnt  [ROB_DEPTH];
+  // per-channel run-length store: latched at SEG_LAST, read at retire so the accumulator's
+  // frptr frees each channel's run (count slots off the ring tail) in one go.
+  logic [N_CH-1:0][CNT_W-1:0]  run_cnt [ROB_DEPTH];
   always_ff @(posedge aclk)
-    if (SEG_LAST) begin
-      run_head[alloc_ptr] <= SEG_HEAD_PTR;
-      run_cnt [alloc_ptr] <= SEG_NPKTS_CH;
-    end
-  assign RESP_HEAD_PTR  = run_head[retire_ptr];
-  assign RESP_NPKTS_CH  = run_cnt [retire_ptr];
+    if (SEG_LAST) run_cnt[alloc_ptr] <= SEG_NPKTS_CH;
+  assign RESP_NPKTS_CH = run_cnt[retire_ptr];
 
   // all flop updates (admit / SEG_LAST / cmpl / retire are parallel)
   always_ff @(posedge aclk or negedge aresetn) begin

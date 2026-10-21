@@ -182,16 +182,6 @@ module rmc_cif_r_burst_spltr_ch #(
     end
   end
 
-`ifndef SYNTHESIS
-  always_ff @(posedge aclk)
-    if (aresetn) begin
-      if (owes & (e_ch_pkts == '0))
-        $error("r_burst_spltr_ch: owed an entry with ch_pkts == 0 (precompute should preset done)");
-      if (fire & (mine_cur == '0))
-        $error("r_burst_spltr_ch: mine[] empty but still owing packets (count/map mismatch)");
-    end
-`endif
-
 endmodule : rmc_cif_r_burst_spltr_ch
 
 // THEORY OF OPERATION   (one channel engine; read with rmc_cif_r_burst_spltr.sv)

@@ -306,12 +306,10 @@ module rmc_cif #(
     .ROB_IDX        (ar_rob_idx),
     .SEG_LAST       (ar_seg_last),
     .SEG_ROB_IDX    (ar_seg_rob_idx),
-    .SEG_HEAD_PTR   (ar_seg_head_ptr),
     .RESP_VALID     (rsp_valid),
     .RESP_READY     (rsp_ready),
     .RESP_ID        (rsp_id),
     .RESP_RESP      (rsp_resp),
-    .RESP_HEAD_PTR  (rsp_head_ptr),
     .RESP_BASE_CH   (rsp_base_ch),
     .RESP_ADDR_LO   (rsp_addr_lo),
     .RESP_LEN       (rsp_len),
@@ -367,14 +365,12 @@ module rmc_cif #(
     .ROB_IDX        (/* TODO: -> u_w_burst_spltr */),
     .SEG_LAST       (1'b0),
     .SEG_NPKTS      ('0),
-    .SEG_HEAD_PTR   ('0),
     .SEG_NPKTS_CH   ('0),
     // retire -> AXI B response + per-channel run free to the write accumulator
     .RESP_VALID     (bvalid),
     .RESP_READY     (bready),
     .RESP_ID        (bid),
     .RESP_RESP      (bresp),
-    .RESP_HEAD_PTR  (/* TODO: -> write accumulator free */),
     .RESP_NPKTS_CH  (/* TODO: -> write accumulator free */)
   );
 
