@@ -356,12 +356,14 @@ module rmc_cif #(
     .SEG_LAST       (1'b0),
     .SEG_NPKTS      ('0),
     .SEG_HEAD_PTR   ('0),
-    // retire -> AXI B response
+    .SEG_NPKTS_CH   ('0),
+    // retire -> AXI B response + per-channel run free to the write accumulator
     .RESP_VALID     (bvalid),
     .RESP_READY     (bready),
     .RESP_ID        (bid),
     .RESP_RESP      (bresp),
-    .RESP_HEAD_PTR  (/* TODO: -> write_alloc slot free */)
+    .RESP_HEAD_PTR  (/* TODO: -> write accumulator free */),
+    .RESP_NPKTS_CH  (/* TODO: -> write accumulator free */)
   );
 
   // request builder stubs (TODO: fed by u_wseg once the write issue path is built)
