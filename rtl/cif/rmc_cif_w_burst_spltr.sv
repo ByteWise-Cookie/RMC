@@ -5,18 +5,19 @@
 // line, then hands w_rob the per-channel run descriptor.
 //
 // Per line, paced by the write accumulator's `filled` pulse (the line's data is staged):
-//   ch    = walk_channel(line)                  which DRAM channel (asserted to the alloc)
+//   ch    = walk_channel(line)                  which DRAM channel (asserted via ch/ch_valid)
 //   daddr = addrmap(line address)               DRAM coords
-//   slot  = head_ptr[ch]   (from the SRAM manager, fanned to the accumulator too)
-//   emit  { op=write, rob_idx, ch, daddr, slot, wstrb } -> MC request FIFO
-//   pulse alloc[ch]        -> SRAM manager advances head_ptr[ch]
-//   bookkeep: first hit of ch records head_ptr[ch] as that channel's run base;
+//   slot  = write_in_ptr[ch]  (from the frptr block, the same value the accumulator writes at)
+//   emit  packet_*[ch] = { rob_idx, daddr, slot } -> MC request FIFO (op=write; mask in SRAM)
+//   pulse alloc[ch]        -> frptr advances write_in_ptr[ch]
+//   bookkeep: first hit of ch records write_in_ptr[ch] as that channel's run base;
 //             cnt[ch]++ ; n_pkt--.
 // At n_pkt==0: drive SEG_LAST + SEG_NPKTS (total) + SEG_HEAD_PTR[N_CH] + SEG_NPKTS_CH[N_CH]
-// to w_rob, then take the next admitted request. Narrow/unaligned masking rides as wstrb.
+// to w_rob, then take the next admitted request. Narrow/unaligned masking rides as the
+// per-slot wstrb the accumulator stored in WD-SRAM, not in the packet.
 //
 // The walk is the same {line,off} + walk_channel as rmc_cif_r_resp. The WD-SRAM write and
-// the per-channel ring pointers live in the accumulator and the SRAM manager, not here.
+// the per-channel ring pointers live in the accumulator and the frptr blocks, not here.
 //
 // STUB: ports + the walk are TODO, built against the accumulator / SRAM manager stubs.
 
@@ -38,8 +39,8 @@ module rmc_cif_w_burst_spltr #(
   input  logic                   aclk,
   input  logic                   aresetn,
 
-  // request in (from the pre-ROB AW_req buffer): address + burst params. No slot_base
-  // (slots come from the free-list). Captured on req_in_valid & ROB_READY.
+  // request in (from the pre-ROB AW_req buffer): address + burst params. Captured with the
+  // ROB index when ROB_READY.
   input  logic                   req_in_valid,
   input  logic [AXI_AW-1:0]      req_in_addr,
   input  logic [7:0]             req_in_len,
@@ -52,50 +53,49 @@ module rmc_cif_w_burst_spltr #(
   input  logic [ROB_IDX_W-1:0]   ROB_IDX,
   input  logic                   ROB_READY,
 
-  // WD-SRAM manager free-list: one free slot per packet
-  input  logic [SLOT_W-1:0]      free_slot,        // next free WD-SRAM slot
-  input  logic                   free_slot_valid,  // a free slot is available
-  output logic                   free_slot_take,   // seg consumes a free slot this cycle
+  // per-channel write pointer + space from the frptr blocks (fanned in). The slot a line
+  // writes to IS write_in_ptr[ch] - the same value the accumulator writes at and the packet
+  // carries. sram_ready[ch] gates issue on that channel's ring having room.
+  input  logic [N_CH-1:0][SLOT_W-1:0] write_in_ptr,
+  input  logic [N_CH-1:0]             sram_ready,
+  output logic [N_CH-1:0]             alloc,        // one-hot: advance the issued channel's write ptr
 
-  // back to w_rob when the split finishes
+  // accumulator handshake: filled (a 64B line is staged) in; the splitter asserts the line's
+  // channel (ch + ch_valid) so the accumulator commits it to that channel's WD-SRAM.
+  input  logic                   filled,
+  output logic [CH_W-1:0]        ch,
+  output logic                   ch_valid,
+
+  // back to w_rob when the split finishes: total count + per-channel run descriptor
   output logic                   SEG_LAST,
   output logic [CNT_W-1:0]       SEG_NPKTS,
-  // write slot chain -> w_rob / accumulator (head latched at admit, tail per packet)
-  output logic [SLOT_W-1:0]      SEG_HEAD_PTR,     // first slot of the chain
-  // TODO: per-packet {slot, prev_slot} so the accumulator links next_ram[slot]
+  output logic [N_CH-1:0][SLOT_W-1:0] SEG_HEAD_PTR,  // each channel's first slot (run base)
+  output logic [N_CH-1:0][CNT_W-1:0]  SEG_NPKTS_CH,  // each channel's slot count
 
-  // packet stream out, ONE PER CHANNEL
+  // MC write packet stream, ONE PER CHANNEL. The byte mask rides in WD-SRAM (wdb_wstrb),
+  // not in the packet; the MC reads WD-SRAM[ch][slot] for data + mask.
   output logic [N_CH-1:0]                packet_valid,
   input  logic [N_CH-1:0]                packet_ready,
   output logic [N_CH-1:0][ROB_IDX_W-1:0] packet_rob_index,
   output logic [N_CH-1:0][DADDR_W-1:0]   packet_daddr,
-  output logic [N_CH-1:0][PKT_NUM_W-1:0] packet_pkt_num,
-  output logic [N_CH-1:0]                packet_last_in_txn,
-  output logic [N_CH-1:0][SLOT_W-1:0]    packet_slot,       // from the free-list, not base+k
-  output logic [N_CH-1:0][PKT_OFF_W-1:0] packet_offset,
-  output logic [N_CH-1:0]                packet_narrow
+  output logic [N_CH-1:0][SLOT_W-1:0]    packet_slot    // = write_in_ptr[ch] when issued
 );
 
-  // LEFT TO DO: mirror the pipelined read segmenter (rmc_cif_r_burst_spltr + rmc_cif_r_burst_spltr_ch):
-  //   - same pre-ROB ring queue + N_CH per-channel stride engines, multi-outstanding,
-  //     in-order head pop -> SEG_LAST + SEG_ROB_IDX to w_rob (wrob needs the same
-  //     multi-outstanding rework rrob just got).
-  //   - n_pkts / k0 / stride math is identical (contract map: ch = low CH_W line bits).
-  //   WRITE-SPECIFIC difference = the slot engine: pull free_slot per issued packet
-  //   (free_slot_take) instead of dbuf_base+k, build the chain (next_ram[slot]), and
-  //   emit SEG_HEAD_PTR (first slot) + per-packet {slot, prev} to w_rob / accumulator.
-  //   packet_op = write (tie high at the top). No read-meta sideband (mask rides WSTRB).
-  assign free_slot_take     = 1'b0;
-  assign SEG_LAST           = 1'b0;
-  assign SEG_NPKTS          = '0;
-  assign SEG_HEAD_PTR       = '0;
-  assign packet_valid       = '0;
-  assign packet_rob_index   = '0;
-  assign packet_daddr       = '0;
-  assign packet_pkt_num     = '0;
-  assign packet_last_in_txn = '0;
-  assign packet_slot        = '0;
-  assign packet_offset      = '0;
-  assign packet_narrow      = '0;
+  // STUB: the in-order {line,off}+walk_channel walk is TODO, built against the frptr and
+  // accumulator stubs. Per line: wait filled; ch = walk_channel(line); if sram_ready[ch],
+  // assert ch/ch_valid, emit packet_* [ch] with slot = write_in_ptr[ch], pulse alloc[ch];
+  // record write_in_ptr[ch] as SEG_HEAD_PTR[ch] on the first hit, SEG_NPKTS_CH[ch]++, n_pkt--.
+  // At n_pkt==0 drive SEG_LAST + SEG_NPKTS + SEG_HEAD_PTR[N_CH] + SEG_NPKTS_CH[N_CH].
+  assign alloc            = '0;
+  assign ch               = '0;
+  assign ch_valid         = 1'b0;
+  assign SEG_LAST         = 1'b0;
+  assign SEG_NPKTS        = '0;
+  assign SEG_HEAD_PTR     = '0;
+  assign SEG_NPKTS_CH     = '0;
+  assign packet_valid     = '0;
+  assign packet_rob_index = '0;
+  assign packet_daddr     = '0;
+  assign packet_slot      = '0;
 
 endmodule : rmc_cif_w_burst_spltr

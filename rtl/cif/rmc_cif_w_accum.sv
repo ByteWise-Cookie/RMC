@@ -1,12 +1,12 @@
 // rmc_cif_w_accum.sv
 // Write accumulator. Consumes the AXI W data channel, stages beats into 64 B lines (full
-// size = one beat per line; narrow = several beats packed by byte offset, with wstrb
-// accumulated), and OWNS the per-channel WD-SRAM write port (we/addr/din/wstrb). The slot
-// address is write_in_ptr[ch] from the per-channel frptr block (the accumulator does not
-// own the pointer); the burst splitter asserts ch for the staged line and uses the same
-// write_in_ptr[ch] as the packet slot. wready to the master is gated by sram_ready[ch]
-// (space) from the frptr blocks. Handshake with the splitter: filled (a line is staged)
-// <-> take (the splitter consumed it).
+// size = one beat per line; narrow = several beats packed by byte offset, with the strobe
+// accumulated), and drives the per-channel WD-SRAM WRITE-ENABLE + DATA + MASK. It does NOT
+// drive the write ADDRESS: the frptr owns write_in_ptr and that is wired to wdb_addr at the
+// top level, so the SRAM port has one address source (frptr) and one data source (here).
+// The burst splitter asserts the line's channel (ch_in + ch_in_valid) so it commits to that
+// channel; wready to the master is gated by w_ready[ch] (room) from the frptr blocks.
+// Handshake: filled (a line is staged) out <-> ch_in_valid (splitter consumed it) in.
 //
 // STUB: ports fixed; the W-beat staging / narrow packing and the SRAM write are TODO.
 
@@ -37,30 +37,27 @@ module rmc_cif_w_accum #(
   input  logic [2:0]                   axi_size,
   input  logic                         req_valid,        // a request's W stream is active
 
-  // per-channel pointer + space from the frptr blocks (fanned in)
-  input  logic [N_CH-1:0][SLOT_W-1:0]  write_in_ptr,
-  input  logic [N_CH-1:0]              sram_ready,
-
-  // splitter handshake: filled (a 64 B line is staged) <-> take; ch_in = the channel the
-  // splitter asserts for that line (selects which WD-SRAM to commit to)
+  // splitter handshake: filled (a 64 B line is staged) out; the splitter asserts the line's
+  // channel (ch_in + ch_in_valid) so the accumulator commits it to that channel's WD-SRAM.
   output logic                         filled,
-  input  logic                         take,
+  input  logic                         ch_in_valid,
   input  logic [CH_W-1:0]              ch_in,
 
-  // WD-SRAM write port, per channel (owned here): data + the accumulated byte mask
+  // WD-SRAM write port, per channel (owned here): write-enable + data + byte mask. The
+  // address comes from the frptr (write_in_ptr), wired at the top level; w_sram_ready is the
+  // per-channel room from the frptr, gating this write and wready to the master.
+  input  logic [N_CH-1:0]              w_sram_ready,
   output logic [N_CH-1:0]              wdb_we,
-  output logic [N_CH-1:0][SLOT_W-1:0]  wdb_addr,
-  output logic [N_CH-1:0][DW-1:0]      wdb_din,
-  output logic [N_CH-1:0][STRB_W-1:0]  wdb_wstrb
+  output logic [N_CH-1:0][DW-1:0]      write_data,
+  output logic [N_CH-1:0][STRB_W-1:0]  write_data_strobe
 );
 
-  // STUB body: safe defaults so it elaborates. TODO: W-beat staging, narrow packing,
-  // and the per-channel SRAM write at write_in_ptr[ch_in].
-  assign wready    = 1'b0;
-  assign filled    = 1'b0;
-  assign wdb_we    = '0;
-  assign wdb_addr  = '0;
-  assign wdb_din   = '0;
-  assign wdb_wstrb = '0;
+  // STUB body: safe defaults so it elaborates. TODO: W-beat staging, narrow packing, and the
+  // per-channel SRAM write-enable + data at the frptr's write_in_ptr[ch_in].
+  assign wready            = 1'b0;
+  assign filled            = 1'b0;
+  assign wdb_we            = '0;
+  assign write_data        = '0;
+  assign write_data_strobe = '0;
 
 endmodule : rmc_cif_w_accum
