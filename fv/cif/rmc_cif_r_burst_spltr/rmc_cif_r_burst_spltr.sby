@@ -39,8 +39,8 @@ async2sync
 
 [files]
 ../rtl/rtl_pkg_config/rmc_cfg_pkg.sv
-../rtl/cif/rmc_cif_addrmap.sv
-../rtl/cif/rmc_cif_r_burst_spltr_ch.sv
-../rtl/cif/rmc_cif_r_burst_spltr.sv
+../rtl/cif/cif_utils/rmc_cif_addrmap.sv
+../rtl/cif/read_path/rmc_cif_r_burst_spltr_ch.sv
+../rtl/cif/read_path/rmc_cif_r_burst_spltr.sv
 cif/rmc_cif_r_burst_spltr/rmc_cif_r_burst_spltr_fv.sv
 cif/rmc_cif_r_burst_spltr/rmc_cif_r_burst_spltr_bind.sv

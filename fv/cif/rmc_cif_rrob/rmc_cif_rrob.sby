@@ -46,6 +46,6 @@ async2sync
 
 [files]
 ../rtl/rtl_pkg_config/rmc_cfg_pkg.sv
-../rtl/cif/rmc_cif_rrob.sv
+../rtl/cif/read_path/rmc_cif_rrob.sv
 cif/rmc_cif_rrob/rmc_cif_rrob_fv.sv
 cif/rmc_cif_rrob/rmc_cif_rrob_bind.sv
