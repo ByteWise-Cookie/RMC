@@ -262,9 +262,25 @@ module rmc_cif #(
     .idle           (/* TODO */)
   );
 
-  // write burst splitter - still a stub. In-order walk (twin of rmc_cif_r_burst_spltr):
-  // per line compute ch/daddr, slot = head_ptr[ch] from the SRAM manager, emit the write
-  // packet, and hand u_wrob the per-channel run descriptor at SEG_LAST.
+  // WRITE PATH INTEGRATION - DEFERRED (wire this block LAST, once the read-path final changes
+  // settle, so read and write share the same MC-req + frptr plumbing). The write sub-blocks are
+  // built and lint clean on their own, but the stubs below still use their OLD ports and will
+  // NOT elaborate against the new ones - intentionally left until the wire-up pass.
+  //
+  // Final write datapath (see write_flow.txt REVISED ARCHITECTURE for the full diagram):
+  //   AW  -> u_val_aw -> rmc_cif_aw_reqbuf -> rmc_cif_w_burst_spltr (sole consumer, ROB master)
+  //   W   -> rmc_cif_w_data_fifo -> rmc_cif_w_accum (shape+skip from the splitter)
+  //   splitter.ld_* -> rmc_cif_w_pkt_gen ; accum.stage_valid/take <-> pkt_gen
+  //   pkt_gen <-> rmc_cif_frptr[N_CH] (write_in_ptr/sram_ready/alloc) ; pkt_gen.wr_en -> wdb_*
+  //   pkt_gen.packet_* -> MC req ; splitter.entry_* -> u_wrob ; u_wrob.RESP_* -> rmc_cif_w_resp -> B
+  //   u_wrob.RESP_NPKTS_CH[c] + retire -> frptr[c].free_* (wrob owns the WD-SRAM free)
+  //
+  // Glue still to build before this wires up:
+  //   - rmc_cif_aw_reqbuf : reshape to {id,addr,len,size,error} (drop rob_idx; no pre-admit)
+  //   - rmc_cif_w_data_fifo : W-data decouple buffer (missing)
+  //   - shared N_CH->1 MC request arbiter + per-channel req FIFO (also the read path's open TODO):
+  //     collapses per-channel packet_valid[N_CH] onto the single async_mc_req_* port and gives
+  //     both paths req_fifo_ready[N_CH]. Until it exists, req_fifo_ready has no safe source.
   rmc_cif_w_burst_spltr #(
     .ROB_DEPTH (ROB_DEPTH), .MAX_PKTS (MAX_PKTS), .AXI_AW (AXI_AW)
   ) u_w_burst_spltr (
