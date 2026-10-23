@@ -1,23 +1,19 @@
 // rmc_cif_w_burst_spltr.sv
-// WRITE burst splitter (twin of rmc_cif_r_burst_spltr, but in order and issuing writes).
-// Pure control: it moves no data and owns no slot pointers. For one admitted write request
-// it walks the 64B lines in address order and emits one DRAM write command per line, then
-// hands w_rob the per-channel run descriptor.
+// WRITE burst splitter: pure sequencer AND ROB master, sole consumer of the AW request buffer.
+// It is the ONLY writer of the ROB and writes it exactly once per request - entry_valid at the
+// last packet (seg_last) - so there is no separate claim/reserve: the ROB holds rob_free high
+// while not full and offers rob_idx = alloc_ptr, which the splitter tags onto every packet and
+// which advances on that one entry write. Walks the 64 B lines in address order and emits one
+// line descriptor per line to the packet_formation_unit. Controls the accumulator (shape +
+// skip). A front-end error (error != 0) issues no packets: drain the accumulator, then write
+// the entry with npkts = 0 at drain_done.
 //
-// Per line, paced by the write accumulator's `filled` pulse (the line's data is staged):
-//   ch    = addrmap(line address).ch           which DRAM channel (asserted via ch/ch_valid)
-//   daddr = addrmap(line address).daddr         DRAM coords
-//   slot  = write_in_ptr[ch]  (from the frptr block, the same value the accumulator writes at)
-//   emit  packet_*[ch] = { rob_idx, daddr, slot } -> MC request FIFO (op=write; mask in SRAM)
-//   pulse alloc[ch]        -> frptr advances write_in_ptr[ch]
-//   bookkeep: cnt[ch]++ ; one line fewer to go.
-// At the last line: drive SEG_LAST + SEG_NPKTS (total) + SEG_NPKTS_CH[N_CH] to w_rob (the
-// per-channel counts free each ring at retire; the base is implicit, in-order), then capture
-// the next admitted request. Narrow/unaligned masking rides as the
-// per-slot wstrb the accumulator stored in WD-SRAM, not in the packet.
-//
-// The accumulator and the splitter step in lockstep on line order (W beats arrive in AW
-// order; the splitter walks the same order), so `filled` marks exactly the line at line_q.
+// Internals: on capture it latches the request and computes its in-page line span from
+// address + len + size - cap_l0 (first line), cap_llast (last line), cap_npkts (count). It then
+// walks line_q from cap_l0, maps each line to ch/daddr through the shared address map, and
+// counts lines per channel in cnt_q while n_left counts down to the last line. A line is
+// consumed when pkt_gen takes it (fire = ld_valid & ld_ready). One request at a time:
+// burst_splitter_ready is low during a walk, so the W stream and the ROB stay in order.
 
 import rmc_cfg_pkg::*;
 
@@ -25,59 +21,64 @@ module rmc_cif_w_burst_spltr #(
   parameter int ROB_DEPTH = 32,         // ROB entries             [root knob]
   parameter int MAX_PKTS  = 64,         // max packets per request [root knob]
   parameter int AXI_AW    = SYS_ADDR_W, // AXI address width       [root knob]
-  parameter int N_WDB     = 64,         // WD-SRAM slots per channel [root knob]
+  parameter int AXI_IDW   = 8,          // AXI id width            [root knob]
 
   // derived (localparam: never passed in)
   localparam int ROB_IDX_W = (ROB_DEPTH > 1) ? $clog2(ROB_DEPTH)  : 1,
   localparam int CNT_W     = (MAX_PKTS  > 1) ? $clog2(MAX_PKTS+1) : 1,
-  localparam int SLOT_W    = (N_WDB     > 1) ? $clog2(N_WDB)      : 1,
-  localparam int LINE_W    = PAGE_LSB - PKT_OFF_W        // in-page line index width (= 6)
+  localparam int LINE_W    = PAGE_LSB - PKT_OFF_W       // in-page line index width (= 6)
 )(
   input  logic                   aclk,
   input  logic                   aresetn,
 
-  // request in (from the AW request buffer): address + burst params + the ROB index it got
-  input  logic                   req_in_valid,
-  input  logic [AXI_AW-1:0]      req_in_addr,
-  input  logic [7:0]             req_in_len,
-  input  logic [2:0]             req_in_size,
-  input  logic [ROB_IDX_W-1:0]   req_in_rob_idx,
-  output logic                   req_in_ready,     // pop the buffer when we capture a request
+  // a_request_buf (post-validator): id + burst params + validator verdict
+  input  logic                   aw_request_valid,
+  output logic                   burst_splitter_ready,
+  input  logic [AXI_IDW-1:0]     aw_id,
+  input  logic [7:0]             aw_len,
+  input  logic [2:0]             aw_size,
+  input  logic [AXI_AW-1:0]      phy_adr,
+  input  logic [1:0]             error,            // 00 ok / 10 SLVERR / 11 DECERR
 
   // live address map (CSR)
   input  logic [DEC_W-1:0][MAP_SEL_W-1:0] addr_map,
 
-  // frptr: per-channel write pointer + space in; alloc out (advance the issued channel)
-  input  logic [N_CH-1:0][SLOT_W-1:0] write_in_ptr,
-  input  logic [N_CH-1:0]             sram_ready,
-  output logic [N_CH-1:0]             alloc,
+  // w_rob: slot offer in, single entry write-back out (the only signal to the ROB)
+  input  logic [ROB_IDX_W-1:0]   rob_idx_in,       // offered slot (= alloc_ptr), held for the req
+  input  logic                   rob_free,         // slot free (ROB not full)
+  output logic                   entry_valid,      // one write at seg_last (drain_done on error)
+  output logic [AXI_IDW-1:0]     entry_id,
+  output logic [1:0]             entry_resp,
+  output logic [CNT_W-1:0]       entry_npkts,      // 0 on a front error
+  output logic [N_CH-1:0][CNT_W-1:0]  entry_npkts_ch,
 
-  // accumulator: filled (a 64B line is staged) in; assert the line's channel (ch + ch_valid)
-  input  logic                   filled,
-  output logic [CH_W-1:0]        ch,
-  output logic                   ch_valid,
+  // accumulator control (shape held for the W stream + drop; drain_done back)
+  output logic                   stage_en,
+  output logic                   skip,
+  output logic [PKT_OFF_W-1:0]   stage_len,        // in-line start byte offset
+  output logic [2:0]             stage_size,
+  input  logic                   drain_done,
 
-  // back to w_rob when the split finishes: total count + per-channel slot count (for the free)
-  output logic                   SEG_LAST,
-  output logic [CNT_W-1:0]       SEG_NPKTS,
-  output logic [N_CH-1:0][CNT_W-1:0]  SEG_NPKTS_CH,  // each channel's slot count
-
-  // MC write packet stream, ONE PER CHANNEL (mask rides in WD-SRAM, not the packet)
-  output logic [N_CH-1:0]                packet_valid,
-  input  logic [N_CH-1:0]                packet_ready,
-  output logic [N_CH-1:0][ROB_IDX_W-1:0] packet_rob_index,
-  output logic [N_CH-1:0][DADDR_W-1:0]   packet_daddr,
-  output logic [N_CH-1:0][SLOT_W-1:0]    packet_slot
+  // packet_formation_unit: line descriptor (consumed on ld_valid & ld_ready)
+  output logic                   ld_valid,
+  input  logic                   ld_ready,
+  output logic [CH_W-1:0]        ld_ch,
+  output logic [DADDR_W-1:0]     ld_daddr,
+  output logic [ROB_IDX_W-1:0]   ld_rob_idx
 );
 
   // walk state for the one request being split
   logic                 run;
   logic [AXI_AW-1:0]    s_addr;
-  logic [ROB_IDX_W-1:0] s_rob;
+  logic [2:0]           s_size;
+  logic [AXI_IDW-1:0]   s_id;
+  logic [1:0]           s_err;
+  logic                 drop_q;        // the current request is drain-only (front error)
+  logic [ROB_IDX_W-1:0] s_rob;         // the ROB slot this request holds (rob_idx_in latched)
   logic [LINE_W-1:0]    line_q;        // current in-page line index
   logic [CNT_W-1:0]     n_left;        // lines still to issue
 
-  // per-channel line count (recorded during the walk, shipped at SEG_LAST for the free)
+  // per-channel line count (recorded during the walk, shipped at the entry write for the free)
   logic [N_CH-1:0][CNT_W-1:0]  cnt_q;
 
   // bounds of an incoming request (combinational, used at capture)
@@ -85,11 +86,11 @@ module rmc_cif_w_burst_spltr #(
   logic [15:0]         n_bytes, last_byte;
   logic [LINE_W-1:0]   cap_l0, cap_llast;
   logic [CNT_W-1:0]    cap_npkts;
-  assign size_mask = PAGE_LSB'((32'd1 << req_in_size) - 32'd1);
-  assign a_al      = req_in_addr[PAGE_LSB-1:0] & ~size_mask;
-  assign n_bytes   = (16'(req_in_len) + 16'd1) << req_in_size;
+  assign size_mask = PAGE_LSB'((32'd1 << aw_size) - 32'd1);
+  assign a_al      = phy_adr[PAGE_LSB-1:0] & ~size_mask;
+  assign n_bytes   = (16'(aw_len) + 16'd1) << aw_size;
   assign last_byte = 16'(a_al) + n_bytes - 16'd1;
-  assign cap_l0    = req_in_addr[PAGE_LSB-1:PKT_OFF_W];
+  assign cap_l0    = phy_adr[PAGE_LSB-1:PKT_OFF_W];
   assign cap_llast = last_byte[PAGE_LSB-1:PKT_OFF_W];
   assign cap_npkts = CNT_W'(cap_llast) - CNT_W'(cap_l0) + CNT_W'(1);
 
@@ -105,36 +106,25 @@ module rmc_cif_w_burst_spltr #(
     .offset   (/* unused: byte-in-line, mask is in WD-SRAM */)
   );
 
-  // capture a request when idle; otherwise issue the current line
-  assign req_in_ready = ~run & req_in_valid;        // one-cycle capture/pop
-  wire   capture      = req_in_ready;
+  // capture a request when idle and a ROB slot is free; accept = pop the request buffer
+  assign burst_splitter_ready = ~run & rob_free;
+  wire   capture      = burst_splitter_ready & aw_request_valid;
+  wire   is_last      = (n_left == CNT_W'(1));
+  wire   fire         = ld_valid & ld_ready;        // pkt_gen consumed this line
 
-  // issue the current line: it is staged (filled), its channel has room, and the MC FIFO
-  // accepts it. packet_valid asserts (does not depend on packet_ready); fire advances.
-  wire issue_ok = run & filled & sram_ready[w_ch];
-  wire fire     = issue_ok & packet_ready[w_ch];
-  wire is_last  = (n_left == CNT_W'(1));
+  // line descriptor (combinational off the walk state). A dropped request emits no packets.
+  assign ld_valid     = run & ~drop_q;
+  assign ld_ch        = w_ch;
+  assign ld_daddr     = w_daddr;
+  assign ld_rob_idx   = s_rob;
 
-  always_comb begin
-    packet_valid     = '0;
-    packet_rob_index = '0;
-    packet_daddr     = '0;
-    packet_slot      = '0;
-    alloc            = '0;
-    if (issue_ok) begin
-      packet_valid[w_ch]     = 1'b1;
-      packet_rob_index[w_ch] = s_rob;
-      packet_daddr[w_ch]     = w_daddr;
-      packet_slot[w_ch]      = write_in_ptr[w_ch];
-    end
-    if (fire) alloc[w_ch] = 1'b1;              // advance that channel's write pointer
-  end
+  // accumulator control: hold the shape for the whole W stream
+  assign stage_en     = run;
+  assign skip         = drop_q;
+  assign stage_len    = s_addr[PKT_OFF_W-1:0];
+  assign stage_size   = s_size;
 
-  // tell the accumulator which channel to commit the staged line to, as it is accepted
-  assign ch       = w_ch;
-  assign ch_valid = fire;
-
-  // SEG_* to w_rob at the last accepted line, with the final per-channel counts
+  // per-channel counts and totals (bumped by the line being consumed this cycle)
   logic [N_CH-1:0][CNT_W-1:0] cnt_final;
   logic [CNT_W-1:0]           npkts_sum;
   always_comb begin
@@ -144,24 +134,35 @@ module rmc_cif_w_burst_spltr #(
       npkts_sum    = npkts_sum + cnt_final[c];
     end
   end
-  assign SEG_LAST     = fire & is_last;
-  assign SEG_NPKTS    = SEG_LAST ? npkts_sum : '0;
-  assign SEG_NPKTS_CH = cnt_final;
+
+  // ENTRY to w_rob: good request at its last consumed line; dropped request at drain_done
+  assign entry_valid    = (fire & is_last) | drain_done;
+  assign entry_id       = s_id;
+  assign entry_resp     = drop_q ? s_err : 2'b00;
+  assign entry_npkts    = npkts_sum;                // 0 on a drop (no line ever fired)
+  assign entry_npkts_ch = cnt_final;
 
   always_ff @(posedge aclk or negedge aresetn) begin
     if (!aresetn) begin
-      run   <= 1'b0;
-      cnt_q <= '0;
+      run    <= 1'b0;
+      drop_q <= 1'b0;
+      cnt_q  <= '0;
     end else if (capture) begin
       run    <= 1'b1;
-      s_addr <= req_in_addr;
-      s_rob  <= req_in_rob_idx;
+      drop_q <= (error != 2'b00);
+      s_addr <= phy_adr;
+      s_size <= aw_size;
+      s_id   <= aw_id;
+      s_err  <= error;
+      s_rob  <= rob_idx_in;
       line_q <= cap_l0;
       n_left <= cap_npkts;
       cnt_q  <= '0;
+    end else if (drop_q) begin
+      if (drain_done) run <= 1'b0;                  // dropped burst drained, release
     end else if (fire) begin
-      cnt_q[w_ch] <= cnt_q[w_ch] + CNT_W'(1);   // one more line on this channel
-      if (is_last) run <= 1'b0;                 // request fully issued
+      cnt_q[w_ch] <= cnt_q[w_ch] + CNT_W'(1);       // one more line on this channel
+      if (is_last) run <= 1'b0;                     // request fully issued
       else begin
         line_q <= line_q + 1'b1;
         n_left <= n_left - CNT_W'(1);

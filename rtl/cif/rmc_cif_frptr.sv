@@ -1,11 +1,16 @@
 // rmc_cif_frptr.sv
 // Per-channel SRAM slot ring (free/write pointer tracker). Owns no SRAM port - it only hands
 // out the slot pointer and the space flag. Used on BOTH paths, one instance per channel:
-//   write (WD-SRAM): write_in_ptr = the slot the accumulator writes W data into and the
-//     splitter puts in the packet; alloc = a write line was issued; free = w_rob retire.
-//   read  (RD-SRAM): write_in_ptr = the slot the MC writes returned data into (the splitter
-//     hands it to the read packet); alloc = a read packet was issued; free = r_resp retire.
+//   write (WD-SRAM): write_in_ptr = the slot the accumulator's line is written to and the write
+//     packet carries; alloc = w_pkt_gen committed a line; free = w_rob retire.
+//   read  (RD-SRAM): write_in_ptr = the slot the MC writes returned data into and the read
+//     packet carries; alloc = a read packet was issued; free = r_resp retire.
 // In both, the value is "where data gets written into the SRAM next", hence write_in_ptr.
+//
+// Sizing: sram_ready is per-line (room for >= 1). Nothing pre-reserves a whole request's run,
+// so the oldest unretired request must be able to fit its per-channel run in the ring, i.e.
+// N_SLOTS >= max per-channel lines in one request - else it can stall with nothing older to
+// free. (= OPEN item 5.)
 //
 // The ring is a write pointer (wptr = write_in_ptr) and an occupancy counter (occ). alloc
 // advances wptr by one and occ up by one; a retire frees a whole run and drops occ by

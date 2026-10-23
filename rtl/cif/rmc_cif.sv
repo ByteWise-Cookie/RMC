@@ -164,19 +164,21 @@ module rmc_cif #(
   rmc_cif_reqvalidator #(.AXI_AW(AXI_AW)) u_val_ar (
     .req_addr (araddr), .req_len (arlen), .req_size (arsize), .req_ok (ar_ok));
 
-  // READ PATH LEFT TO DO (rseg/rrob control is wired; these remain):
-  //   - req_dbuf_base: the RD-SRAM slot allocator is not built; u_rseg's
-  //     req_dbuf_base is stubbed. Allocate a contiguous RD-SRAM base per
-  //     admitted read and feed it here.
+  // READ PATH LEFT TO DO (rseg/rrob control + the RD-SRAM slot ring are wired; these remain):
+  //   - RD-SRAM free: wire u_rseg.free_valid / free_burst[N_CH] from u_r_resp retire.
+  //     On the last accepted beat of a request (resp_ready), r_resp releases each channel's
+  //     run: free_valid = that pulse, free_burst[c] = the request's line count on channel c
+  //     (r_resp knows it from its walk). Tied 0 now, which is safe only while pkt_ready is 0
+  //     (nothing allocates); must be driven before reads actually flow or the frptr rings
+  //     fill and stall.
   //   - pkt_* -> MC: u_rseg emits N_CH per-channel packet streams, but this
   //     block has a single async_mc_req_* port. Add per-channel req FIFOs +
   //     an N_CH->1 arbiter (or widen the MC req interface to per-channel).
-  //   - dbuf addressing: global dbuf_base+k (per-channel SRAM sparse) vs a
-  //     packed per-channel index - open; affects RD-SRAM size + resp readback.
   //   - scattered-map fallback: rseg assumes the contract map (ch = low CH_W
   //     line bits); an arbitrary CSR map needs the scan path (not built).
-  // RESP_* -> R channel is now wired through u_r_resp (per-channel RD-SRAM read,
-  // window-mux channel recovery, full-width INCR; narrow-burst trim still TODO).
+  // RESP_* -> R channel is wired through u_r_resp (per-channel RD-SRAM read, window-mux
+  // channel recovery, full-width INCR; narrow-burst trim still TODO). The per-channel slot
+  // ring (alloc + free + not-full) now lives in each engine's rmc_cif_frptr.
 
   // read splitter <-> read ROB handoff nets. Splitter-side widths for ar_len/ar_size and
   // cfg_n_ch_log2 (mirror the splitter's own derivation so the port connections match).
@@ -260,9 +262,25 @@ module rmc_cif #(
     .idle           (/* TODO */)
   );
 
-  // write burst splitter - still a stub. In-order walk (twin of rmc_cif_r_burst_spltr):
-  // per line compute ch/daddr, slot = head_ptr[ch] from the SRAM manager, emit the write
-  // packet, and hand u_wrob the per-channel run descriptor at SEG_LAST.
+  // WRITE PATH INTEGRATION - DEFERRED (wire this block LAST, once the read-path final changes
+  // settle, so read and write share the same MC-req + frptr plumbing). The write sub-blocks are
+  // built and lint clean on their own, but the stubs below still use their OLD ports and will
+  // NOT elaborate against the new ones - intentionally left until the wire-up pass.
+  //
+  // Final write datapath (see write_flow.txt REVISED ARCHITECTURE for the full diagram):
+  //   AW  -> u_val_aw -> rmc_cif_aw_reqbuf -> rmc_cif_w_burst_spltr (sole consumer, ROB master)
+  //   W   -> rmc_cif_w_data_fifo -> rmc_cif_w_accum (shape+skip from the splitter)
+  //   splitter.ld_* -> rmc_cif_w_pkt_gen ; accum.stage_valid/take <-> pkt_gen
+  //   pkt_gen <-> rmc_cif_frptr[N_CH] (write_in_ptr/sram_ready/alloc) ; pkt_gen.wr_en -> wdb_*
+  //   pkt_gen.packet_* -> MC req ; splitter.entry_* -> u_wrob ; u_wrob.RESP_* -> rmc_cif_w_resp -> B
+  //   u_wrob.RESP_NPKTS_CH[c] + retire -> frptr[c].free_* (wrob owns the WD-SRAM free)
+  //
+  // Glue still to build before this wires up:
+  //   - rmc_cif_aw_reqbuf : reshape to {id,addr,len,size,error} (drop rob_idx; no pre-admit)
+  //   - rmc_cif_w_data_fifo : W-data decouple buffer (missing)
+  //   - shared N_CH->1 MC request arbiter + per-channel req FIFO (also the read path's open TODO):
+  //     collapses per-channel packet_valid[N_CH] onto the single async_mc_req_* port and gives
+  //     both paths req_fifo_ready[N_CH]. Until it exists, req_fifo_ready has no safe source.
   rmc_cif_w_burst_spltr #(
     .ROB_DEPTH (ROB_DEPTH), .MAX_PKTS (MAX_PKTS), .AXI_AW (AXI_AW)
   ) u_w_burst_spltr (
