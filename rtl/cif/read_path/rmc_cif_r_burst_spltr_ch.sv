@@ -29,7 +29,7 @@
 //
 // ISSUE / HANDSHAKE
 //   owes      = entry_valid & ~e_ch_done
-//   pkt_valid = owes & pkt_dbuf_adr_ready      (valid never depends on pkt_ready)
+//   pkt_valid = owes & slot_ready              (valid never depends on pkt_ready)
 //   fire      = pkt_valid & pkt_ready
 //   on fire   : dbuf_ptr++ (ring), clear the issued mine bit, m++
 //   first fire (m==0)            : head_ptr_we, head_ptr = this slot (dbuf_ptr)
@@ -195,77 +195,3 @@ module rmc_cif_r_burst_spltr_ch #(
   end
 
 endmodule : rmc_cif_r_burst_spltr_ch
-
-// THEORY OF OPERATION   (one channel engine; read with rmc_cif_r_burst_spltr.sv)
-//
-// ONE LINE
-//   Walk the shared queue; for each entry, either SKIP it (no lines for me) or
-//   ISSUE exactly e_ch_pkts packets - this channel's lines of that request, in
-//   ascending address order - into my own contiguous RD-SRAM slot run.
-//
-// THE THREE PER-ENTRY OUTCOMES (entry = queue slot at rd_ptr)
-//   entry_valid==0 : queue caught up to alloc_ptr. Wait, do nothing.
-//   e_ch_done==1   : SKIP. rd_ptr++ this cycle, UNCONDITIONALLY (never gated by
-//                    pkt_ready/dbuf). Head-pop safety relies on skip advancing at
-//                    exactly 1/cycle so pop can never overtake a live rd_ptr.
-//   e_ch_done==0   : ISSUE e_ch_pkts packets (>=1). On the last one, set_done +
-//                    rd_ptr++. If a packet can't fire (FIFO or RD-SRAM not ready)
-//                    the engine PAUSES on the same entry (mine_reg holds the rest).
-//
-// LINE SELECT  (which of the 64 page lines are mine)
-//   mine_comb[i] = (i >= L0) & (line_channel(line_byte(i)) == ch_id)
-//     - i >= L0 drops lines before the request start (L0 = e_base[5:0]).
-//     - line_channel is the SAME decode the top used to count, so "how many are
-//       mine" (e_ch_pkts) and "which are mine" (mine[]) can never disagree.
-//     - L_last is NOT needed: the request's lines are the lowest lines >= L0, so
-//       the first e_ch_pkts set bits of mine are exactly this request's lines for
-//       this channel. We stop after e_ch_pkts fires (m == e_ch_pkts-1 = last).
-//   ffs(mine_cur) returns the lowest set bit -> sel_i, the next line to issue.
-//   mine_reg = mine_cur with sel_i cleared, so the next ffs yields the next line.
-//
-// ISSUE / HANDSHAKE  (per fire)
-//   owes      = entry_valid & ~e_ch_done
-//   pkt_valid = owes & pkt_dbuf_adr_ready        (valid NEVER waits on pkt_ready)
-//   fire      = pkt_valid & pkt_ready
-//   first fire (m==0)           : head_ptr_we, head_ptr = dbuf_ptr (run base)
-//   last  fire (m==e_ch_pkts-1) : set_done, rd_ptr++ , m<=0  (no idle bubble)
-//   every fire                  : dbuf_ptr++ (ring over N_SLOTS), clear mine bit
-//   e_ch_pkts==1                : first and last are the same fire
-//
-// CYCLE-BY-CYCLE  (Example A, ch0 from the top file: e_ch_pkts=3, lines 2,4,6)
-//   assume pkt_ready=1, pkt_dbuf_adr_ready=1 throughout, dbuf_ptr starts 0.
-//
-//   cyc | active m  mine_cur(set bits)  sel_i fire first last | dbuf head_we done
-//   ----+------------------------------------------------------+-----------------
-//    T0 |   0    0   {2,4,6,...}           2    1    1    0     |  0   head[0]=0
-//    T1 |   1    1   {4,6,...}             4    1    0    0     |  1
-//    T2 |   1    2   {6,...}               6    1    0    1     |  2         set_done
-//    T3 |  (loads next entry at the new rd_ptr; active=0, m=0)
-//
-//   At T0 mine_comb is used directly (active=0). At T1/T2 mine_reg (latched &
-//   cleared) feeds ffs. set_done at T2 rides to queue[rd_ptr].done[ch0]; head[0]=0
-//   was captured at T0. A pause (e.g. pkt_ready=0 at T1) simply repeats T1 with the
-//   same sel_i until it fires - mine_reg and m are unchanged while paused.
-//
-// WHERE ch_done LIVES  (the loop that is easy to misread)
-//   ch_done is NOT a register in this engine. It is queue[rd_ptr].done[ch_id] in
-//   the top. This engine READS it (e_ch_done) and WRITES it via the set_done pulse;
-//   the top does the flop update. So "set it, then later read it done" closes
-//   through the queue flop, not through a combinational loop here.
-//
-// PIPELINING NOTES  (the engine's own critical path - separate from precompute)
-//   Per-cycle combinational chain while issuing:
-//       e_base -> 64x line_channel -> mine_comb        (64 parallel map decodes)
-//              -> ffs (64->6 priority encode) -> sel_i
-//              -> line_byte(sel_i) -> rmc_cif_addrmap  -> pkt_daddr
-//   mine_comb is recomputed EVERY cycle today even though, within one entry, it
-//   only loses one bit per fire. Two independent ways to shorten it:
-//     1. Compute mine[] ONCE per entry (on load) and keep only mine_reg; drop
-//        mine_comb from the steady-state path. First packet then costs one extra
-//        cycle unless you precompute mine[] for the next entry during the current
-//        one (the engine already knows rd_ptr+1's fields are stable once enqueued).
-//     2. Register sel_i / the addrmap output: make pkt_daddr a registered output
-//        one cycle behind the ffs, so line_channel+ffs and the addrmap decode sit
-//        in different stages. pkt_valid/dbuf handshake must then pipeline with it.
-//   Note the skip path MUST stay single-cycle and unconditional (head-pop safety);
-//   pipeline the ISSUE datapath, not the rd_ptr advance rate for skips.
