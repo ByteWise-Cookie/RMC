@@ -104,6 +104,7 @@ module rmc_cif_r_burst_spltr_ch #(
   // this channel's RD-SRAM slot ring: the alloc pointer (where the MC writes returned data /
   // the slot this packet carries) advances on each fire; a request's run frees at r_resp
   // retire. sram_ready gates issue so the ring never overruns unretired data.
+  logic            owes, fire, first, last, skip;   // issue control (assigned below)
   logic [SLOT_W-1:0] dbuf_ptr;       // = frptr write_in_ptr (slot for this packet)
   logic              slot_ready;     // = frptr sram_ready
   rmc_cif_frptr #(.N_SLOTS (N_SLOTS)) u_frptr (
@@ -140,8 +141,7 @@ module rmc_cif_r_burst_spltr_ch #(
   logic [LN_W-1:0] sel_i;
   assign sel_i = ffs(mine_cur);
 
-  // issue control
-  logic            owes, fire, first, last, skip;
+  // issue control (owes/fire/... declared above, before the frptr instance uses fire)
   logic [CNT_W-1:0] m_eff;
   assign owes      = entry_valid & ~e_ch_done;
   assign first     = ~active;                       // m == 0
