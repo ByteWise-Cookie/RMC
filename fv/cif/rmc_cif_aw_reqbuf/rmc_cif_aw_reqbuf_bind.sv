@@ -3,6 +3,7 @@
 
 bind rmc_cif_aw_reqbuf rmc_cif_aw_reqbuf_fv #(
   .DEPTH (DEPTH),
+  .ENT_W (AXI_IDW + AXI_AW + 8 + 3 + 2),
   .PTR_W (PTR_W),
   .OCC_W (OCC_W)
 ) u_fv (

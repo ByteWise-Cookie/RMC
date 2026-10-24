@@ -53,9 +53,25 @@ module rmc_cif_frptr_fv #(
     write_in_ptr == wptr);
   // wptr advances by one (mod N_SLOTS) exactly on an alloc
   as_wptr_adv: assert property (@(posedge aclk) disable iff (!aresetn)
-    en & $past(en) & $past(alloc) |->
-      wptr == (($past(wptr) == SLOT_W'(N_SLOTS-1)) ? '0 : $past(wptr) + 1'b1));
+    !(en & $past(en) & $past(alloc)) || (wptr == (($past(wptr) == SLOT_W'(N_SLOTS-1)) ? '0 : $past(wptr) + 1'b1)));
   as_wptr_hold: assert property (@(posedge aclk) disable iff (!aresetn)
-    en & $past(en) & ~$past(alloc) |-> wptr == $past(wptr));
+    !(en & $past(en) & ~$past(alloc)) || (wptr == $past(wptr)));
+
+  // occupancy model from the ports: +1 per alloc, -free_burst per free. The ring is full
+  // (sram_ready low) exactly when every slot is in use.
+  logic [OCC_W:0] fv_occ;
+  always_ff @(posedge aclk or negedge aresetn)
+    if (!aresetn) fv_occ <= '0;
+    else          fv_occ <= fv_occ + (OCC_W+1)'(alloc) - (free_valid ? (OCC_W+1)'(free_burst) : '0);
+  as_occ_model: assert property (@(posedge aclk) disable iff (!aresetn)
+    (OCC_W+1)'(occ) == fv_occ && sram_ready == (fv_occ != (OCC_W+1)'(N_SLOTS)));
+  c_full:  cover property (@(posedge aclk) disable iff (!aresetn) !sram_ready);
+  c_wrap:  cover property (@(posedge aclk) disable iff (!aresetn) alloc && wptr == SLOT_W'(N_SLOTS-1));
+  c_free:  cover property (@(posedge aclk) disable iff (!aresetn) free_valid && free_burst > 1 && alloc);
+
+  // the proof starts in reset (without this the first state is unconstrained)
+  logic fv_started = 1'b0;
+  always_ff @(posedge aclk) fv_started <= 1'b1;
+  m_reset_first: assume property (@(posedge aclk) fv_started || !aresetn);
 
 endmodule : rmc_cif_frptr_fv

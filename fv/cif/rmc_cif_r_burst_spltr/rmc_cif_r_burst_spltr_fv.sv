@@ -277,6 +277,12 @@ module rmc_cif_r_burst_spltr_fv #(
   wire [N_CH-1:0] prdy = rmc_cif_r_burst_spltr.pkt_ready;
   // slot-ready is now internal to each engine's frptr (was the pkt_dbuf_adr_ready port)
   wire [N_CH-1:0] drdy;
+  // r_resp frees only slots that are in use (a retired request's run on that channel)
+  for (genvar c = 0; c < N_CH; c++) begin : g_free
+    `ASSUME(m_free_le_occ, !rmc_cif_r_burst_spltr.free_valid[c]
+            || 32'(rmc_cif_r_burst_spltr.free_burst[c]) <=
+               32'(rmc_cif_r_burst_spltr.g_eng[c].u_ch.u_frptr.occ));
+  end
   for (genvar c = 0; c < N_CH; c++) begin : g_drdy
     assign drdy[c] = rmc_cif_r_burst_spltr.g_eng[c].u_ch.slot_ready;
   end

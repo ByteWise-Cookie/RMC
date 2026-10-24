@@ -37,12 +37,22 @@ module rmc_cif_w_resp_fv #(
 
   // AXI B: once valid and not accepted, stay valid with stable payload
   as_b_stable: assert property (@(posedge aclk) disable iff (!aresetn)
-    en & $past(en) & $past(bvalid) & ~$past(bready) |->
-      bvalid & (bid == $past(bid)) & (bresp == $past(bresp)));
+    !(en & $past(en) & $past(bvalid) & ~$past(bready)) || (bvalid & (bid == $past(bid)) & (bresp == $past(bresp))));
 
   // a captured beat carries exactly what RESP presented on the accepting cycle
   as_capture: assert property (@(posedge aclk) disable iff (!aresetn)
-    en & $past(en) & $past(RESP_VALID & RESP_READY) |->
-      bvalid & (bid == $past(RESP_ID)) & (bresp == $past(RESP_RESP)));
+    !(en & $past(en) & $past(RESP_VALID & RESP_READY)) || (bvalid & (bid == $past(RESP_ID)) & (bresp == $past(RESP_RESP))));
+
+  // no response lost: a retired response is never accepted while an un-taken B is held
+  as_no_overwrite: assert property (@(posedge aclk) disable iff (!aresetn)
+    !(RESP_VALID && RESP_READY && bvalid) || bready);
+  c_b:       cover property (@(posedge aclk) disable iff (!aresetn) bvalid && bready);
+  c_stall:   cover property (@(posedge aclk) disable iff (!aresetn) bvalid && !bready && RESP_VALID);
+  c_b2b:     cover property (@(posedge aclk) disable iff (!aresetn) bvalid && bready && RESP_VALID);
+
+  // the proof starts in reset (without this the first state is unconstrained)
+  logic fv_started = 1'b0;
+  always_ff @(posedge aclk) fv_started <= 1'b1;
+  m_reset_first: assume property (@(posedge aclk) fv_started || !aresetn);
 
 endmodule : rmc_cif_w_resp_fv

@@ -59,14 +59,28 @@ module rmc_cif_w_pkt_gen_fv #(
 
   // capture loads on commit with the line descriptor, slot sampled this cycle (pre-advance)
   as_cap_load: assert property (@(posedge aclk) disable iff (!aresetn)
-    en & $past(en) & $past(commit) |->
-      cap_valid & (cap_ch == $past(ld_ch)) & (cap_rob == $past(ld_rob_idx))
-      & (cap_daddr == $past(ld_daddr)) & (cap_slot == $past(write_in_ptr[ld_ch])));
+    !(en & $past(en) & $past(commit)) || (cap_valid & (cap_ch == $past(ld_ch)) & (cap_rob == $past(ld_rob_idx))
+      & (cap_daddr == $past(ld_daddr)) & (cap_slot == $past(write_in_ptr[ld_ch]))));
 
   // drain-only cycle (no new commit) clears the capture; a full FIFO just holds it (no orphan)
   as_cap_drain: assert property (@(posedge aclk) disable iff (!aresetn)
-    en & $past(en) & $past(~commit & issue_fire) |-> ~cap_valid);
+    !(en & $past(en) & $past(~commit & issue_fire)) || (~cap_valid));
   as_cap_hold:  assert property (@(posedge aclk) disable iff (!aresetn)
-    en & $past(en) & $past(cap_valid & ~issue_fire & ~commit) |-> cap_valid);
+    !(en & $past(en) & $past(cap_valid & ~issue_fire & ~commit)) || (cap_valid));
+
+  // no packet lost: a new commit never overwrites a captured packet the FIFO has not taken
+  as_no_overwrite: assert property (@(posedge aclk) disable iff (!aresetn)
+    !(commit && cap_valid) || issue_fire);
+  // the WD-SRAM write and the slot ring advance only for a line that is really staged
+  as_commit_staged: assert property (@(posedge aclk) disable iff (!aresetn)
+    !(|wr_en) || (stage_valid && ld_valid && sram_ready[ld_ch]));
+  c_commit: cover property (@(posedge aclk) disable iff (!aresetn) commit && cap_valid && issue_fire);
+  c_block:  cover property (@(posedge aclk) disable iff (!aresetn) cap_valid && !issue_fire && ld_valid && stage_valid);
+  c_noslot: cover property (@(posedge aclk) disable iff (!aresetn) ld_valid && stage_valid && !sram_ready[ld_ch]);
+
+  // the proof starts in reset (without this the first state is unconstrained)
+  logic fv_started = 1'b0;
+  always_ff @(posedge aclk) fv_started <= 1'b1;
+  m_reset_first: assume property (@(posedge aclk) fv_started || !aresetn);
 
 endmodule : rmc_cif_w_pkt_gen_fv
