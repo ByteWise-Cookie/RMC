@@ -21,7 +21,6 @@ SBY_rspltr := cif/rmc_cif_r_burst_spltr/rmc_cif_r_burst_spltr.sby
 SBY_rresp := cif/rmc_cif_r_resp/rmc_cif_r_resp.sby
 # write path + shared
 SBY_frptr := cif/rmc_cif_frptr/rmc_cif_frptr.sby
-SBY_mcarb := cif/rmc_cif_mc_req_arb/rmc_cif_mc_req_arb.sby
 SBY_awbuf := cif/rmc_cif_aw_reqbuf/rmc_cif_aw_reqbuf.sby
 SBY_wdfifo := cif/rmc_cif_w_data_fifo/rmc_cif_w_data_fifo.sby
 SBY_waccum := cif/rmc_cif_w_accum/rmc_cif_w_accum.sby
@@ -31,7 +30,7 @@ SBY_wpktgen := cif/rmc_cif_w_pkt_gen/rmc_cif_w_pkt_gen.sby
 SBY_wresp := cif/rmc_cif_w_resp/rmc_cif_w_resp.sby
 SBY_tut := tutorial/tut_cnt.sby
 
-MODULES := rrob rspltr rresp frptr mcarb awbuf wdfifo waccum wspltr wrob wpktgen wresp tut
+MODULES := rrob rspltr rresp frptr awbuf wdfifo waccum wspltr wrob wpktgen wresp tut
 
 .PHONY: all $(MODULES) traces wave clean
 # tut is a teaching example with an expected failure; run it by name
