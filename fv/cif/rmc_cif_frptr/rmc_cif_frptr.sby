@@ -1,0 +1,38 @@
+# rmc_cif_frptr formal run. Run from fv/ (paths relative to it):  make frptr [T=<task>]
+#
+# task = <config>_<mode>
+#   config  s4    N_SLOTS=4   small ring (fast, non-trivial wrap)
+#           full  RTL default (N_SLOTS=64)
+#   mode    prove  unbounded proof (k-induction)
+#           cover  a trace per cover
+#           bmc    bounded check from reset
+
+[tasks]
+s4_prove   s4 prove
+s4_cover   s4 cover
+s4_bmc     s4 bmc
+full_prove full prove
+
+[options]
+prove: mode prove
+prove: depth 3
+cover: mode cover
+cover: depth 20
+bmc:   mode bmc
+bmc:   depth 20
+
+[engines]
+smtbmc bitwuzla
+
+[script]
+plugin -i slang
+s4:   read_slang --top rmc_cif_frptr --no-implicit-memories -D FORMAL -G N_SLOTS=4 rmc_cfg_pkg.sv rmc_cif_frptr.sv rmc_cif_frptr_fv.sv rmc_cif_frptr_bind.sv
+full: read_slang --top rmc_cif_frptr --no-implicit-memories -D FORMAL rmc_cfg_pkg.sv rmc_cif_frptr.sv rmc_cif_frptr_fv.sv rmc_cif_frptr_bind.sv
+prep -top rmc_cif_frptr
+async2sync
+
+[files]
+../rtl/rtl_pkg_config/rmc_cfg_pkg.sv
+../rtl/cif/cif_utils/rmc_cif_frptr.sv
+cif/rmc_cif_frptr/rmc_cif_frptr_fv.sv
+cif/rmc_cif_frptr/rmc_cif_frptr_bind.sv

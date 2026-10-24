@@ -6,9 +6,12 @@
 //   - there is no pending_split; A_ID_READY = ~rob_full.
 //   - SEG_LAST is indexed by SEG_ROB_IDX (seals THAT slot), not the tail; it does not
 //     move the tail.
+//   - completions are PER CHANNEL (one resp FIFO per channel): two channels can complete the
+//     same entry the same cycle, so outflow + the target (npkts_ch) are per channel, and
+//     retire needs every channel matched. npkts_ch doubles as RESP_NPKTS_CH (the RD-SRAM free).
 //
 // Three layers:
-//   1. reference model : an independent ring + per-slot scoreboard from the ports only
+//   1. reference model : an independent ring + per-slot, per-channel scoreboard from the ports
 //   2. assumptions     : legal neighbour behaviour (completions, one SEG_LAST per slot)
 //   3. assertions      : outputs match the model + DUT state == model (induction)
 
@@ -31,11 +34,12 @@ module rmc_cif_rrob_fv #(
   input logic                  aresetn,
 
   // DUT ports
-  input logic                  cmpl_valid,
-  input logic [ROB_IDX_W-1:0]  cmpl_rob_index,
-  input logic                  cmpl_err,
+  input logic [N_CH-1:0]                cmpl_valid,
+  input logic [N_CH-1:0][ROB_IDX_W-1:0] cmpl_rob_index,
+  input logic [N_CH-1:0]                cmpl_err,
   input logic [REQ_META_W-1:0] AW_REQUEST,
   input logic [CNT_W-1:0]      ADMIT_NPKTS,
+  input logic [N_CH-1:0][CNT_W-1:0] ADMIT_NPKTS_CH,
   input logic [PAGE_LSB-1:0]   ADMIT_ADDR_LO,
   input logic [7:0]            ADMIT_LEN,
   input logic [2:0]            ADMIT_SIZE,
@@ -51,6 +55,7 @@ module rmc_cif_rrob_fv #(
   input logic [AXI_IDW-1:0]    RESP_ID,
   input logic [1:0]            RESP_RESP,
   input logic [N_CH-1:0][SLOT_PTR_W-1:0] RESP_HEAD_PTR,
+  input logic [N_CH-1:0][CNT_W-1:0] RESP_NPKTS_CH,
   input logic [CH_W-1:0]       RESP_BASE_CH,
   input logic [PAGE_LSB-1:0]   RESP_ADDR_LO,
   input logic [7:0]            RESP_LEN,
@@ -65,7 +70,8 @@ module rmc_cif_rrob_fv #(
   input logic                  ent_derr      [ROB_DEPTH],
   input logic                  inflow_complt [ROB_DEPTH],
   input logic [CNT_W-1:0]      n_pkts        [ROB_DEPTH],
-  input logic [CNT_W-1:0]      outflow_cnt   [ROB_DEPTH],
+  input logic [N_CH-1:0][CNT_W-1:0] npkts_ch [ROB_DEPTH],
+  input logic [N_CH-1:0][CNT_W-1:0] outflow_cnt [ROB_DEPTH],
   input logic [7:0]            madm_len      [ROB_DEPTH],
   input logic [2:0]            madm_size     [ROB_DEPTH],
   input logic [PAGE_LSB-1:0]   madm_alo      [ROB_DEPTH],
@@ -77,13 +83,13 @@ module rmc_cif_rrob_fv #(
 `define COVER(name, expr)  name: cover  property (@(posedge aclk) disable iff (!aresetn) (expr))
 `define ASSUME(name, expr) name: assume property (@(posedge aclk) (expr))
 `define NEXT(a, b)         (!$past(aresetn) || !$past(a) || (b))
-// what the neighbours (rseg, MC) must guarantee: assumed when the ROB is proven
-// alone, PROVEN when rseg is really there (FV_JOIN, the rseg_rrob run)
 `ifdef FV_JOIN
 `define ENV(name, expr)    name: assert property (@(posedge aclk) disable iff (!aresetn) (expr))
 `else
 `define ENV(name, expr)    name: assume property (@(posedge aclk) (expr))
 `endif
+
+  localparam int NCH = rmc_cfg_pkg::N_CH;
 
   // ------------------------------------------------------------------------
   // 1. reference model
@@ -103,12 +109,13 @@ module rmc_cif_rrob_fv #(
   logic [ROB_DEPTH-1:0] fv_live;    // admitted, not yet retired
   logic [ROB_DEPTH-1:0] fv_sealed;  // seen its SEG_LAST
 
-  logic [AXI_IDW-1:0]   fv_id     [ROB_DEPTH];
-  logic                 fv_slverr [ROB_DEPTH]; // validation fail or any cmpl_err
-  logic [CNT_W-1:0]     fv_npkts  [ROB_DEPTH];
-  logic [CNT_W-1:0]     fv_cmpl   [ROB_DEPTH]; // completions seen
-  logic [ADM_W-1:0]     fv_adm    [ROB_DEPTH]; // trim meta, known at admit
-  logic [N_CH-1:0][SLOT_PTR_W-1:0] fv_hd [ROB_DEPTH]; // head pointers, at SEG_LAST
+  logic [AXI_IDW-1:0]        fv_id     [ROB_DEPTH];
+  logic                      fv_slverr [ROB_DEPTH]; // validation fail or any cmpl_err
+  logic [CNT_W-1:0]          fv_npkts  [ROB_DEPTH]; // total (informational)
+  logic [NCH-1:0][CNT_W-1:0] fv_run    [ROB_DEPTH]; // per-channel target
+  logic [NCH-1:0][CNT_W-1:0] fv_cmpl   [ROB_DEPTH]; // completions seen, per channel
+  logic [ADM_W-1:0]          fv_adm    [ROB_DEPTH]; // trim meta, known at admit
+  logic [NCH-1:0][SLOT_PTR_W-1:0] fv_hd [ROB_DEPTH]; // head pointers, at SEG_LAST
 
   always_ff @(posedge aclk or negedge aresetn) begin
     if (!aresetn) begin
@@ -117,7 +124,6 @@ module rmc_cif_rrob_fv #(
       fv_live   <= '0;
       fv_sealed <= '0;
     end else begin
-      // admit: claim the tail slot, record n_pkts (known now), and advance
       if (admit) begin
         fv_live[fv_tail]   <= 1'b1;
         fv_sealed[fv_tail] <= 1'b0;
@@ -125,18 +131,19 @@ module rmc_cif_rrob_fv #(
         fv_slverr[fv_tail] <= ~admit_ok;
         fv_cmpl[fv_tail]   <= '0;
         fv_npkts[fv_tail]  <= ADMIT_NPKTS;
+        fv_run[fv_tail]    <= ADMIT_NPKTS_CH;
         fv_adm[fv_tail]    <= {ADMIT_LEN, ADMIT_SIZE, ADMIT_ADDR_LO, ADMIT_BASE_CH};
         fv_tail            <= ring_inc(fv_tail);
       end
-      // SEG_LAST: seal the slot it names (not the tail); brings only the head pointers
       if (SEG_LAST) begin
         fv_sealed[SEG_ROB_IDX] <= 1'b1;
         fv_hd[SEG_ROB_IDX]     <= SEG_HEAD_PTR;
       end
-      if (cmpl_valid) begin
-        fv_cmpl[cmpl_rob_index] <= fv_cmpl[cmpl_rob_index] + 1'b1;
-        if (cmpl_err) fv_slverr[cmpl_rob_index] <= 1'b1;
-      end
+      for (int c = 0; c < NCH; c++)
+        if (cmpl_valid[c]) begin
+          fv_cmpl[cmpl_rob_index[c]][c] <= fv_cmpl[cmpl_rob_index[c]][c] + 1'b1;
+          if (cmpl_err[c]) fv_slverr[cmpl_rob_index[c]] <= 1'b1;
+        end
       if (retire) begin
         fv_live[fv_head] <= 1'b0;
         fv_head          <= ring_inc(fv_head);
@@ -144,8 +151,21 @@ module rmc_cif_rrob_fv #(
     end
   end
 
-  wire fv_head_done = fv_live[fv_head] & fv_sealed[fv_head]
-                    & (fv_cmpl[fv_head] == fv_npkts[fv_head]);
+  // head done: sealed and every channel matched its per-channel target
+  logic head_match;
+  always_comb begin
+    head_match = 1'b1;
+    for (int c = 0; c < NCH; c++)
+      if (fv_cmpl[fv_head][c] != fv_run[fv_head][c]) head_match = 1'b0;
+  end
+  wire fv_head_done = fv_live[fv_head] & fv_sealed[fv_head] & head_match;
+
+  // per-channel sum of the admitted counts (must equal the total)
+  logic [CNT_W+NCH:0] adm_ch_sum;
+  always_comb begin
+    adm_ch_sum = '0;
+    for (int c = 0; c < NCH; c++) adm_ch_sum = adm_ch_sum + (CNT_W+NCH+1)'(ADMIT_NPKTS_CH[c]);
+  end
 
   // ------------------------------------------------------------------------
   // 2. assumptions (model state only)
@@ -154,31 +174,35 @@ module rmc_cif_rrob_fv #(
   always_ff @(posedge aclk) fv_started <= 1'b1;
   `ASSUME(m_reset_first, fv_started || !aresetn);
 
-  // n_pkts ships at admit: a legal count for the request being admitted
-  // splitter: a validated request has 1..MAX_PKTS packets, a rejected one none
-  `ENV(m_admit_npkts, !admit || (ADMIT_NPKTS <= CNT_W'(MAX_PKTS) && admit_ok == (ADMIT_NPKTS != '0)));
+  // splitter: a validated request has 1..MAX_PKTS packets (rejected none); per-channel adds up
+  `ENV(m_admit_npkts, !admit || (ADMIT_NPKTS <= CNT_W'(MAX_PKTS) && admit_ok == (ADMIT_NPKTS != '0)
+                                 && adm_ch_sum == (CNT_W+NCH+1)'(ADMIT_NPKTS)));
 
-  // one SEG_LAST per slot: it names a live, not-yet-sealed slot (no n_pkts here anymore)
+  // one SEG_LAST per slot: it names a live, not-yet-sealed slot
   `ENV(m_seg_last, !SEG_LAST || (
        32'(SEG_ROB_IDX) < ROB_DEPTH
     && fv_live[SEG_ROB_IDX] && !fv_sealed[SEG_ROB_IDX]));
 
-  // a completion targets a live slot and never exceeds its packet count (known at admit)
-  `ENV(m_cmpl, !cmpl_valid || (
-       32'(cmpl_rob_index) < ROB_DEPTH
-    && fv_live[cmpl_rob_index]
-    && fv_cmpl[cmpl_rob_index] < fv_npkts[cmpl_rob_index]));
+  // each channel's completion targets a live slot and never exceeds its per-channel count
+  logic cmpl_ok;
+  always_comb begin
+    cmpl_ok = 1'b1;
+    for (int c = 0; c < NCH; c++)
+      if (cmpl_valid[c] &&
+          !(32'(cmpl_rob_index[c]) < ROB_DEPTH
+            && fv_live[cmpl_rob_index[c]]
+            && fv_cmpl[cmpl_rob_index[c]][c] < fv_run[cmpl_rob_index[c]][c]))
+        cmpl_ok = 1'b0;
+  end
+  `ENV(m_cmpl, cmpl_ok);
 
   // ------------------------------------------------------------------------
   // 3a. interface checks
   // ------------------------------------------------------------------------
-  // admit side: ready iff not full; a fresh admit lands in a free slot at the tail
   `ASSERT(a_ready,    A_ID_READY == ~(&fv_live));
   `ASSERT(a_no_reuse, !admit || !fv_live[ROB_IDX]);
   `ASSERT(a_idx,      ROB_IDX == fv_tail);
 
-  // retire side: valid exactly when the oldest request is done, in order, carrying its
-  // own id / resp / metadata
   `ASSERT(a_resp_valid, RESP_VALID == fv_head_done);
   `ASSERT(a_resp_id,    !RESP_VALID || RESP_ID == fv_id[fv_head]);
   `ASSERT(a_resp_resp,  !RESP_VALID || RESP_RESP == (fv_slverr[fv_head] ? 2'b10 : 2'b00));
@@ -186,14 +210,12 @@ module rmc_cif_rrob_fv #(
                               RESP_VALID && $stable(RESP_ID) && $stable(RESP_RESP)));
   `ASSERT(a_resp_meta,  !RESP_VALID ||
           ({RESP_LEN, RESP_SIZE, RESP_ADDR_LO, RESP_BASE_CH} == fv_adm[fv_head]
-           && RESP_HEAD_PTR == fv_hd[fv_head]));
+           && RESP_HEAD_PTR == fv_hd[fv_head] && RESP_NPKTS_CH == fv_run[fv_head]));
 
-  // reset: first cycle out of reset the ROB is empty, idle and ready
   `ASSERT(a_reset, $past(aresetn) || (
        alloc_ptr == '0 && retire_ptr == '0 && occ == '0 && fv_live == '0
     && A_ID_READY && !RESP_VALID));
 
-  // back-pressure: a full ring never accepts; a refused admit leaves the ring untouched
   `ASSERT(a_full_bp, !(&fv_live) || !A_ID_READY);
   `ASSERT(a_refuse,  `NEXT(A_ID_VALID && !A_ID_READY && !retire,
                            $stable(alloc_ptr)));
@@ -201,34 +223,39 @@ module rmc_cif_rrob_fv #(
   // ------------------------------------------------------------------------
   // 3b. induction helpers: DUT state == model state
   // ------------------------------------------------------------------------
-  // DUT occupancy == number of live slots in the model
   `ASSERT(a_occ,       occ == OCC_W'($countones(fv_live)) && occ <= OCC_W'(ROB_DEPTH));
   `ASSERT(a_ptr_range, 32'(alloc_ptr) < ROB_DEPTH && 32'(retire_ptr) < ROB_DEPTH);
   `ASSERT(a_tail,      alloc_ptr  == fv_tail);
-  `ASSERT(a_head,      retire_ptr == fv_head);
+  `ASSERT(a_headp,     retire_ptr == fv_head);
 
-  // alloc sits occ slots ahead of retire (mod ROB_DEPTH)
   wire [OCC_W:0] tail_lin  = (OCC_W+1)'(retire_ptr) + (OCC_W+1)'(occ);
   wire [OCC_W:0] tail_wrap = (tail_lin >= (OCC_W+1)'(ROB_DEPTH)) ? tail_lin - (OCC_W+1)'(ROB_DEPTH) : tail_lin;
   `ASSERT(a_ring,      (OCC_W+1)'(alloc_ptr) == tail_wrap);
   `ASSERT(a_alloc_move, `NEXT(!admit,  $stable(alloc_ptr)));
   `ASSERT(a_ret_move,   `NEXT(!retire, $stable(retire_ptr)));
 
-  // the live slots are exactly the occ slots starting at retire_ptr
   for (genvar i = 0; i < ROB_DEPTH; i++) begin : g_slot
     wire [OCC_W-1:0] age = (i >= retire_ptr) ? OCC_W'(i) - OCC_W'(retire_ptr)
                                              : OCC_W'(i) + OCC_W'(ROB_DEPTH) - OCC_W'(retire_ptr);
     wire live   = fv_live[i];
     wire sealed = fv_sealed[i];
+    logic cnt_eq, cnt_le;
+    always_comb begin
+      cnt_eq = 1'b1; cnt_le = 1'b1;
+      for (int c = 0; c < NCH; c++) begin
+        if (outflow_cnt[i][c] != fv_cmpl[i][c]) cnt_eq = 1'b0;
+        if (fv_cmpl[i][c]     >  fv_run[i][c])   cnt_le = 1'b0;
+      end
+    end
 
     `ASSERT(a_live,   live == (age < occ));
     `ASSERT(a_id,     !live || ent_id[i] == fv_id[i]);
     `ASSERT(a_err,    !live || (ent_err[i] | ent_derr[i]) == fv_slverr[i]);
     `ASSERT(a_inflow, !live || inflow_complt[i] == sealed);
-    `ASSERT(a_cnt,    !live || outflow_cnt[i] == fv_cmpl[i]);
-    `ASSERT(a_npkts,  !live || (n_pkts[i] == fv_npkts[i]
-                      && fv_npkts[i] <= CNT_W'(MAX_PKTS)));
-    `ASSERT(a_bound,  !live || fv_cmpl[i] <= fv_npkts[i]);
+    `ASSERT(a_cnt,    !live || cnt_eq);
+    `ASSERT(a_npkts,  !live || (n_pkts[i] == fv_npkts[i] && fv_npkts[i] <= CNT_W'(MAX_PKTS)
+                      && npkts_ch[i] == fv_run[i]));
+    `ASSERT(a_bound,  !live || cnt_le);
     `ASSERT(a_adm,    !live || {madm_len[i], madm_size[i], madm_alo[i], madm_bch[i]} == fv_adm[i]);
     `ASSERT(a_head,   !(live && sealed) || mem_head[i] == fv_hd[i]);
   end
@@ -239,24 +266,20 @@ module rmc_cif_rrob_fv #(
   `COVER(c_retire,     retire);
   `COVER(c_full,       &fv_live);
   `COVER(c_slverr,     retire && RESP_RESP == 2'b10);
-  `COVER(c_reject,     retire && fv_npkts[fv_head] == '0);   // rejected request retires, no packets
+  `COVER(c_reject,     retire && fv_npkts[fv_head] == '0);
   `COVER(c_okay_max,   retire && RESP_RESP == 2'b00 && fv_npkts[fv_head] == CNT_W'(MAX_PKTS));
   `COVER(c_wrap,       retire && retire_ptr == PTR_W'(ROB_DEPTH-1));
-  `COVER(c_early_cmpl, SEG_LAST && fv_cmpl[SEG_ROB_IDX] != 0);
-  // multi-outstanding: two slots live-but-unsealed at once (several mid-split)
+  `COVER(c_bothch,     cmpl_valid == '1);
   `COVER(c_two_split,  $countones(fv_live & ~fv_sealed) >= 2);
-  // out-of-tail seal: SEG_LAST names a slot that is not the tail (pipelined splitter)
   `COVER(c_seal_old,   SEG_LAST && SEG_ROB_IDX != fv_tail);
 
 `ifdef FV_LIVE
   // ------------------------------------------------------------------------
-  // bounded liveness (d4_live task only: the fairness assumptions narrow the
-  // inputs, so they are never compiled into the safety proofs)
+  // bounded liveness (d4_live task only)
   // ------------------------------------------------------------------------
-  // a response never waits longer than RESP_READY may stay low
   localparam int FV_RDY_MAX = 4;
-  logic [3:0] fv_rdy_low;   // cycles in a row with RESP_READY low
-  logic [3:0] fv_wait;      // cycles in a row a response has been waiting
+  logic [3:0] fv_rdy_low;
+  logic [3:0] fv_wait;
   always_ff @(posedge aclk or negedge aresetn) begin
     if (!aresetn) begin
       fv_rdy_low <= '0;
@@ -271,24 +294,29 @@ module rmc_cif_rrob_fv #(
   `ASSERT(a_resp_live,   fv_wait <= FV_RDY_MAX);
   `COVER(c_wait_max,     fv_wait == FV_RDY_MAX);
 
-  // the oldest request reaches RESP_VALID within FV_HEAD_MAX cycles, given: rseg
-  // closes the oldest request within FV_SEG_MAX cycles of it becoming the oldest,
-  // and MC returns a completion for it at least every FV_CMPL_MAX cycles.
   localparam int FV_SEG_MAX  = 3;
   localparam int FV_CMPL_MAX = 3;
   localparam int FV_HEAD_MAX = (FV_SEG_MAX + 1) + (FV_CMPL_MAX + 1) * MAX_PKTS;
 
+  // total completions seen by the head, summed over channels
+  logic [CNT_W+NCH:0] head_cmpl_tot;
+  always_comb begin
+    head_cmpl_tot = '0;
+    for (int c = 0; c < NCH; c++) head_cmpl_tot = head_cmpl_tot + (CNT_W+NCH+1)'(fv_cmpl[fv_head][c]);
+  end
+
   wire fv_head_live   = fv_live[fv_head];
   wire fv_head_sealed = fv_sealed[fv_head];
-  wire fv_head_open   = fv_head_live & ~fv_head_sealed;         // still with rseg
-  wire fv_head_short  = fv_head_live & fv_head_sealed           // still owed completions
-                      & (fv_cmpl[fv_head] != fv_npkts[fv_head]);
-  wire fv_head_seal   = SEG_LAST   & (SEG_ROB_IDX    == fv_head);
-  wire fv_head_hit    = cmpl_valid & (cmpl_rob_index == fv_head);
+  wire fv_head_open   = fv_head_live & ~fv_head_sealed;
+  wire fv_head_short  = fv_head_live & fv_head_sealed & ~head_match;  // still owed on some channel
+  wire fv_head_seal   = SEG_LAST & (SEG_ROB_IDX == fv_head);
+  logic fv_head_hit;                                                  // some channel completes head
+  always_comb begin
+    fv_head_hit = 1'b0;
+    for (int c = 0; c < NCH; c++) if (cmpl_valid[c] && cmpl_rob_index[c] == fv_head) fv_head_hit = 1'b1;
+  end
 
-  logic [15:0] fv_seg_wait;   // cycles in a row the oldest waited for its SEG_LAST
-  logic [15:0] fv_cmpl_wait;  // cycles in a row the oldest waited for a completion
-  logic [15:0] fv_head_age;   // cycles in a row the oldest was live without RESP_VALID
+  logic [15:0] fv_seg_wait, fv_cmpl_wait, fv_head_age;
   always_ff @(posedge aclk or negedge aresetn) begin
     if (!aresetn) begin
       fv_seg_wait  <= '0;
@@ -305,12 +333,10 @@ module rmc_cif_rrob_fv #(
   `ASSUME(m_cmpl_fair, !aresetn || !fv_head_short || fv_cmpl_wait < FV_CMPL_MAX || fv_head_hit);
 
   `ASSERT(a_head_live, fv_head_age <= FV_HEAD_MAX);
-
-  // helpers: the age is bounded by the fairness budget already spent
   `ASSERT(a_fair_range, fv_seg_wait <= FV_SEG_MAX && fv_cmpl_wait <= FV_CMPL_MAX);
   `ASSERT(a_age_split,  !fv_head_open || fv_head_age <= fv_seg_wait);
   `ASSERT(a_age_cmpl,   !(fv_head_live && fv_head_sealed) || fv_head_age <=
-                        16'(FV_SEG_MAX + 1) + 16'(FV_CMPL_MAX + 1) * 16'(fv_cmpl[fv_head])
+                        16'(FV_SEG_MAX + 1) + 16'(FV_CMPL_MAX + 1) * 16'(head_cmpl_tot)
                         + fv_cmpl_wait);
 
   `COVER(c_head_age_max, fv_head_age == FV_HEAD_MAX);

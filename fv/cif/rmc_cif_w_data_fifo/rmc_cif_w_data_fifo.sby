@@ -1,0 +1,33 @@
+# rmc_cif_w_data_fifo formal run. From fv/:  make wdfifo [T=<task>]
+#   config  d4 DEPTH=4 ; full RTL default (DEPTH=8)
+#   mode    prove / cover / bmc
+
+[tasks]
+d4_prove   d4 prove
+d4_cover   d4 cover
+d4_bmc     d4 bmc
+full_prove full prove
+
+[options]
+prove: mode prove
+prove: depth 3
+cover: mode cover
+cover: depth 20
+bmc:   mode bmc
+bmc:   depth 20
+
+[engines]
+smtbmc bitwuzla
+
+[script]
+plugin -i slang
+d4:   read_slang --top rmc_cif_w_data_fifo --no-implicit-memories -D FORMAL -G DEPTH=4 rmc_cfg_pkg.sv rmc_cif_w_data_fifo.sv rmc_cif_w_data_fifo_fv.sv rmc_cif_w_data_fifo_bind.sv
+full: read_slang --top rmc_cif_w_data_fifo --no-implicit-memories -D FORMAL rmc_cfg_pkg.sv rmc_cif_w_data_fifo.sv rmc_cif_w_data_fifo_fv.sv rmc_cif_w_data_fifo_bind.sv
+prep -top rmc_cif_w_data_fifo
+async2sync
+
+[files]
+../rtl/rtl_pkg_config/rmc_cfg_pkg.sv
+../rtl/cif/write_path/rmc_cif_w_data_fifo.sv
+cif/rmc_cif_w_data_fifo/rmc_cif_w_data_fifo_fv.sv
+cif/rmc_cif_w_data_fifo/rmc_cif_w_data_fifo_bind.sv

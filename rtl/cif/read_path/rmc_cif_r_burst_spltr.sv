@@ -109,6 +109,7 @@ module rmc_cif_r_burst_spltr #(
   output logic [SIZE_W-1:0]              admit_size,        // ar_size -> resp beat slicing
   output logic [CH_W-1:0]                admit_base_ch,     // channel of line 0 (resp CH walk)
   output logic [N_CH-1:0]                admit_ch_mask,     // channels with ch_pkts > 0
+  output logic [N_CH-1:0][CNT_W-1:0]     admit_npkts_ch,    // per-channel packet count (-> rrob)
 
   // packets out, one stream per channel (from the engines)
   output logic [N_CH-1:0]                pkt_valid,         // packet offered on channel c
@@ -259,6 +260,7 @@ module rmc_cif_r_burst_spltr #(
   assign admit_size      = s1_size;
   assign admit_base_ch   = commit_base_ch;
   assign admit_ch_mask   = commit_ch_mask;
+  assign admit_npkts_ch  = commit_ch_pkts_eff;
 
   // SHARED QUEUE storage
   logic [LINE_W-1:0]           q_base    [QUEUE_DEPTH];
@@ -346,138 +348,3 @@ module rmc_cif_r_burst_spltr #(
   end
 
 endmodule : rmc_cif_r_burst_spltr
-
-// THEORY OF OPERATION   (read together with rmc_cif_r_burst_spltr_ch.sv)
-//
-// ONE LINE
-//   One AXI read request -> a run of 64B line packets, each routed to the DRAM
-//   channel its address maps to, issued per channel in ascending address order,
-//   with a single "all channels finished" pulse (seg_last) back to the ROB.
-//
-// WHY THIS SHAPE
-//   A request is a contiguous run of lines L0..L_last inside one 4KB page
-//   (L0 = ell-zero = the FIRST line = ar_addr[11:6]; L_last = the last line;
-//   not the number ten, and the count L_last-L0+1 varies per request). The
-//   address map scatters those lines across channels in an arbitrary pattern
-//   (channel = line_channel(addr)). We do not know, cheaply, "how many lines go
-//   to channel c" without looking at every line - so PRECOMPUTE counts them once
-//   (popcount), the QUEUE parks that per-channel count, and each ENGINE drains
-//   its own count at its own rate. Decoupling the engines is what lets a slow
-//   channel back-pressure without stalling the others.
-//
-// DATA / CONTROL FLOW
-//
-//   AR (validated) --ar_valid/ar_ready-->  [ bounds || 64x line_channel ]
-//                                             |
-//            +=== S1 (register) ================================================+
-//            |  bounds:   a_al, last_byte_adr  ->  L0, L_last                   |
-//            |         ||  per line: 64x line_channel(i) -> line_ch_v[i]        |
-//            +=== stage 2 (commit) =============================================+
-//            |  n_pkts = L_last - L0 + 1 ;  in_range[i] = L0<=i<=L_last         |
-//            |  popcount: ch_pkts[c] = #lines{in_range & channel==c}           |
-//            |  base_ch = line_ch_v[L0] ;  ch_pkts_eff = validated ? ch_pkts:0 |
-//            |  ch_mask ;  admit = s1_valid & rob_free & ~q_full               |
-//            +----------------+---------------------------------+---------------+
-//                             |                                 |
-//                             v                                 v
-//              admit_* -> ROB meta#1                 ENQUEUE queue[alloc_idx]
-//              {id, validated, npkts,                {base, ch_pkts[N_CH], rob_idx,
-//               addr_lo, len, size,                   done[c]=(ch_pkts[c]==0),
-//               base_ch, ch_mask}                     head[N_CH]}   ; alloc_ptr++
-//                                                          |
-//                                                          v
-//                     +-------------------- SHARED QUEUE (ring) -------------------+
-//                     |  per entry: base, ch_pkts[N_CH], rob_idx, done[N_CH],      |
-//                     |             head[N_CH]        (QUEUE_DEPTH = ROB_DEPTH)     |
-//                     +----+---------------------------------------------+--------+
-//                      rd_ptr[0]                                   rd_ptr[N_CH-1]
-//                          |                                             |
-//                     ENGINE ch0   ...                            ENGINE ch(N-1)
-//                    skip / issue / pause                       skip / issue / pause
-//                          |  pkt_* stream -> cmd FIFO                 |  pkt_* stream
-//                          |  head_we[c], set_done[c]                 |
-//                          +----------------->  queue[rd_ptr].{head,done}[c]  <----+
-//                                                          |
-//                                                          v
-//                                  HEAD POP: ~q_empty & &done[pop_idx]
-//                                                          |  pop_ptr++
-//                                                          v
-//                           seg_last + seg_rob_idx + seg_head_ptr -> ROB meta#2
-//
-//   Two writers touch queue[].done[c]: the enqueue preset (whole word, new slot)
-//   and engine c (bit c only, an already-live slot). entry_valid (rd_ptr!=alloc)
-//   plus q_full keep those off the same slot, so there is no arbitration.
-//
-// WORKED EXAMPLE A  -  default map, fine interleave (channel = addr[6] = line LSB)
-//   Config: N_CH=2, CH_W=1, cfg_n_ch_log2=1. AXI_DW=128b => 16 B/beat, full size.
-//   Request: ar_addr[11:0]=0x080 (aligned), ar_size=4 (16 B), ar_len=19 (20 beats).
-//
-//   bounds:  a_al=0x080;  n_bytes=20*16=320;  last_byte_adr=0x080+320-1=0x1BF
-//            L0     = 0x080[11:6] = 2
-//            L_last = 0x1BF[11:6] = 6
-//            n_pkts = 6-2+1 = 5          lines touched: 2,3,4,5,6
-//
-//   channel(i)=addr[6]=i[0]:   2->0  3->1  4->0  5->1  6->0
-//   ch_pkts = { ch0:3 (lines 2,4,6), ch1:2 (lines 3,5) }   sum=5 = n_pkts  OK
-//   base_ch = channel(2) = 0    ch_mask = 2'b11
-//
-//   admit_* : npkts=5, addr_lo=0x080, len=19, size=4, base_ch=0, mask=11
-//   enqueue : base=<line#>, ch_pkts={3,2}, done={0,0}, head=?
-//
-//   ENGINE ch0 (e_ch_pkts=3): mine = even lines >= 2 = {2,4,6,...}. ffs picks
-//     the lowest each fire; mine_reg clears the issued bit:
-//        fire0: line 2  dbuf_ptr 0 -> head[0]=0 (first), m=0
-//        fire1: line 4  dbuf_ptr 1,               m=1
-//        fire2: line 6  dbuf_ptr 2, set_done[0]   m=2 == e_ch_pkts-1 (last)
-//   ENGINE ch1 (e_ch_pkts=2): mine = odd lines >= 2 = {3,5,...}
-//        fire0: line 3  dbuf_ptr 0 -> head[1]=0,  m=0
-//        fire1: line 5  dbuf_ptr 1, set_done[1]   m=1 (last)
-//   (each engine owns its channel's RD-SRAM, so both head_ptr start at 0.)
-//
-//   HEAD POP: once done={1,1}, seg_last, seg_head_ptr={0,0}, pop_ptr++.
-//
-//   Resp rebuild (rmc_cif_r_resp) walks 2..6 and pulls slots:
-//        line 2 ch0 slot head[0]+0 = 0
-//        line 3 ch1 slot head[1]+0 = 0
-//        line 4 ch0 slot head[0]+1 = 1
-//        line 5 ch1 slot head[1]+1 = 1
-//        line 6 ch0 slot head[0]+2 = 2     -> address order restored.
-//
-// WORKED EXAMPLE B  -  scattered map, coarse interleave (channel = addr[9])
-//   Same request. channel(i) = addr[9] = bit 3 of the line index. Lines 2..6 all
-//   have line-index bit 3 = 0, so EVERY line maps to channel 0:
-//       ch_pkts = { ch0:5, ch1:0 }     base_ch=0    ch_mask=2'b01
-//   ch1 is preset done at enqueue (ch_pkts[1]==0) and its engine SKIPs the entry
-//   at 1/cycle. ch0's engine issues all 5 lines into contiguous slots 0..4.
-//   Nothing special-cased: the same line_channel + popcount + ffs handle both the
-//   fine (A) and coarse (B) interleave. That generality is the whole point of the
-//   popcount/window design over a fixed arithmetic stride.
-//
-// PIPELINING NOTES  (as built: a 1-register, 2-segment precompute pipeline)
-//   The old single-cycle admit was ALL combinational from the AR register:
-//       addr -> bounds -> 64x line_channel -> popcount tree -> ch_pkts
-//            -> base_ch, ch_mask, admit_*  AND  the enqueue write
-//   That is ~24 logic levels (bounds chain ~12, in_range+popcount ~10, commit
-//   ~2). On an AXI-fabric clock (~1.2 GHz, ~20-30 levels of budget per stage) it
-//   sat right at the edge, so one cut is enough: stage 1 takes the bounds and the
-//   decode, stage 2 (the commit) takes the popcount and the handshake.
-//       stage 1  bounds  ||  64x line_channel          (independent, ~12 levels)
-//       stage 2  n_pkts + in_range + popcount + base_ch + ch_mask + admit
-//                + enqueue                               (~12-14 levels)
-//   line_channel reads address bits only, so it is independent of the bounds math
-//   and shares stage 1 with it. Both compute in stage 1's input cone (off the AR
-//   inputs), so the AR-accept register already holds the precompute. n_pkts' final
-//   subtract is done in stage 2 to keep it off the bounds chain.
-//   Control / timing facts:
-//     - whole descriptor flows with a valid bit; admit never fires before the
-//       counts exist (the popcount is in the commit segment).
-//     - elastic valid/ready: S1 is ready when empty or draining; a full ROB/queue
-//       freezes admit and ar_ready. Accepts a new AR every cycle while draining.
-//     - rob_free / rob_idx are sampled at the commit (the cycle the descriptor
-//       commits and the ROB alloc lines up).
-//     - the sum-check and 4KB-cross asserts sit at the commit, on s1_* / n_pkts.
-//   If STA ever flags stage 2, first nudge base_ch or n_pkts into stage 1, then
-//   add a second register, then (last) split the popcount adder tree into group
-//   subtotals. Do not pre-split before the tool asks - at 1.2 GHz this is plenty.
-//   The engines (see ch file) have their own, separate critical path - the
-//   precompute pipeline does not touch them.

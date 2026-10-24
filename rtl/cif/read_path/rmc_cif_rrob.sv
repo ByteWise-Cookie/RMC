@@ -17,16 +17,22 @@
 // split's SEG_LAST, so the count target must already be valid. SEG_LAST then only marks
 // the split done and delivers the resp meta.
 //
+// PER-CHANNEL completions. Each DRAM channel has its own completion (resp) FIFO, so two
+// channels can complete the same entry the same cycle. Outflow is counted PER CHANNEL and the
+// per-channel target (npkts_ch) ships at admit alongside the total (the splitter's per-line
+// popcount). Retire needs every channel matched. npkts_ch doubles as RESP_NPKTS_CH, the
+// per-channel run freed back to the read engines' RD-SRAM rings (frptr) at retire.
+//
 // One request:
-//   admit    : write {id, err, n_pkts, len, size, addr_lo, base_ch} at alloc_ptr, clear
-//              outflow, advance alloc_ptr. addr_lo + base_ch are the resp channel-walk seed.
+//   admit    : write {id, err, n_pkts, npkts_ch, len, size, addr_lo, base_ch} at alloc_ptr,
+//              clear outflow, advance alloc_ptr. addr_lo + base_ch are the resp channel-walk seed.
 //   handoff  : rseg captures ROB_IDX (= alloc_ptr) on admit; it rides the request
 //   SEG_LAST : inflow_complt[SEG_ROB_IDX]=1, mem_head[SEG_ROB_IDX] <= per-channel head slots
-//   cmpl     : outflow_cnt[rob_index]++ ; cmpl_err tags a downstream error
-//   retire   : when inflow_complt && outflow_cnt==n_pkts, drive RESP_* (id, resp, and the read
-//              meta head_ptr/addr_lo/base_ch/len/size for the resp-path rebuild+trim), pop slot
+//   cmpl     : per channel c, outflow_cnt[rob_index[c]][c]++ ; cmpl_err[c] tags a downstream error
+//   retire   : when inflow_complt && every channel's outflow==npkts_ch, drive RESP_* (id, resp,
+//              the read meta, and RESP_NPKTS_CH for the RD-SRAM free), pop slot
 //
-// Completion is a pulse {rob_index, err}; the ROB counts pulses, no packet number.
+// Completion is a pulse {rob_index, err} per channel; the ROB counts pulses, no packet number.
 
 import rmc_cfg_pkg::*;
 
@@ -48,10 +54,10 @@ module rmc_cif_rrob #(
   input  logic                   aclk,
   input  logic                   aresetn,
 
-  // completion in (MC compl async FIFO). Pulse, never back-pressures.
-  input  logic                   cmpl_valid,
-  input  logic [ROB_IDX_W-1:0]   cmpl_rob_index,
-  input  logic                   cmpl_err,         // downstream error -> SLVERR
+  // completion in, ONE per channel (each channel's compl async FIFO). Pulse, never back-pressures.
+  input  logic [N_CH-1:0]              cmpl_valid,
+  input  logic [N_CH-1:0][ROB_IDX_W-1:0] cmpl_rob_index,
+  input  logic [N_CH-1:0]              cmpl_err,     // downstream error on that channel -> SLVERR
 
   // admit (from the burst splitter). The splitter now works the whole request descriptor
   // out at admit (per-line channel popcount), so the resp meta ships EARLY with admit, not
@@ -60,6 +66,7 @@ module rmc_cif_rrob #(
   // per-channel head pointers are still unknown here - they arrive at SEG_LAST.
   input  logic [REQ_META_W-1:0]  AW_REQUEST,       // {A_ID, A_VALIDATED}
   input  logic [CNT_W-1:0]       ADMIT_NPKTS,      // total packets for this request (at admit)
+  input  logic [N_CH-1:0][CNT_W-1:0] ADMIT_NPKTS_CH, // per-channel packet count (retire + free)
   input  logic [PAGE_LSB-1:0]    ADMIT_ADDR_LO,    // ar_addr[PAGE_LSB-1:0]: [PKT_OFF_W-1:0] = trim
                                                    //   offset, [PAGE_LSB-1:PKT_OFF_W] = start line l0.
                                                    //   The resp rebuild walks this per line to re-derive
@@ -90,6 +97,7 @@ module rmc_cif_rrob #(
   output logic [AXI_IDW-1:0]     RESP_ID,
   output logic [1:0]             RESP_RESP,        // 00 OKAY / 10 SLVERR
   output logic [N_CH-1:0][SLOT_PTR_W-1:0] RESP_HEAD_PTR, // per-channel RD-SRAM head slots
+  output logic [N_CH-1:0][CNT_W-1:0] RESP_NPKTS_CH, // per-channel run to free at retire (RD-SRAM)
   output logic [CH_W-1:0]        RESP_BASE_CH,     // channel of line 0 (frozen out-of-page CH bits)
   output logic [PAGE_LSB-1:0]    RESP_ADDR_LO,     // ar_addr[PAGE_LSB-1:0]: [PKT_OFF_W-1:0] trim offset,
                                                    //   [PAGE_LSB-1:PKT_OFF_W] start line (channel walk)
@@ -108,12 +116,13 @@ module rmc_cif_rrob #(
   assign rob_empty = (occ == '0);
 
   // per-slot entry (flops)
-  logic [AXI_IDW-1:0] ent_id        [ROB_DEPTH];    // AXI id (-> RESP_ID)
-  logic               ent_err       [ROB_DEPTH]; // validation fail -> SLVERR
-  logic               ent_derr      [ROB_DEPTH]; // downstream error -> SLVERR
-  logic               inflow_complt [ROB_DEPTH]; // all packets issued (SEG_LAST)
-  logic [CNT_W-1:0]   n_pkts        [ROB_DEPTH];    // packets owed (set at admit)
-  logic [CNT_W-1:0]   outflow_cnt   [ROB_DEPTH];    // completions seen so far
+  logic [AXI_IDW-1:0]         ent_id        [ROB_DEPTH];  // AXI id (-> RESP_ID)
+  logic                       ent_err       [ROB_DEPTH];  // validation fail -> SLVERR
+  logic                       ent_derr      [ROB_DEPTH];  // downstream error -> SLVERR
+  logic                       inflow_complt [ROB_DEPTH];  // all packets issued (SEG_LAST)
+  logic [CNT_W-1:0]           n_pkts        [ROB_DEPTH];   // total packets owed (informational)
+  logic [N_CH-1:0][CNT_W-1:0] npkts_ch      [ROB_DEPTH];   // per-channel target + RD-SRAM free count
+  logic [N_CH-1:0][CNT_W-1:0] outflow_cnt   [ROB_DEPTH];   // completions seen, per channel
 
   // admit payload field-slice (len/size reach mem_meta from rseg at SEG_LAST)
   logic [AXI_IDW-1:0] admit_id;                     // id sliced from AW_REQUEST
@@ -128,12 +137,21 @@ module rmc_cif_rrob #(
   assign A_ID_READY = ~rob_full;
   assign ROB_IDX    = alloc_ptr;
 
+  // retire: every channel's completions have reached its per-channel target
+  logic all_ch_done;
+  always_comb begin
+    all_ch_done = 1'b1;
+    for (int c = 0; c < N_CH; c++)
+      if (outflow_cnt[retire_ptr][c] != npkts_ch[retire_ptr][c]) all_ch_done = 1'b0;
+  end
+
   // retire / response (comb)
   assign RESP_VALID = ~rob_empty
                     & inflow_complt[retire_ptr]
-                    & (outflow_cnt[retire_ptr] == n_pkts[retire_ptr]);
+                    & all_ch_done;
   assign RESP_ID    = ent_id[retire_ptr];
   assign RESP_RESP  = (ent_err[retire_ptr] | ent_derr[retire_ptr]) ? 2'b10 : 2'b00;
+  assign RESP_NPKTS_CH = npkts_ch[retire_ptr];
   wire retire_fire  = RESP_VALID & RESP_READY;  // oldest entry pops this cycle
 
   // resp meta, read out at retire for the resp-path trim. Split by when it is known:
@@ -167,6 +185,7 @@ module rmc_cif_rrob #(
         inflow_complt[alloc_ptr] <= 1'b0;
         outflow_cnt[alloc_ptr]   <= '0;
         n_pkts[alloc_ptr]        <= ADMIT_NPKTS;
+        npkts_ch[alloc_ptr]      <= ADMIT_NPKTS_CH;
         madm_len[alloc_ptr]      <= ADMIT_LEN;
         madm_size[alloc_ptr]     <= ADMIT_SIZE;
         madm_alo[alloc_ptr]      <= ADMIT_ADDR_LO;
@@ -177,10 +196,12 @@ module rmc_cif_rrob #(
       // n_pkts + trim meta were written at admit; here only inflow + the head pointers land.
       if (SEG_LAST)
         inflow_complt[SEG_ROB_IDX] <= 1'b1;
-      if (cmpl_valid) begin
-        outflow_cnt[cmpl_rob_index] <= outflow_cnt[cmpl_rob_index] + 1'b1;
-        if (cmpl_err) ent_derr[cmpl_rob_index] <= 1'b1;
-      end
+      // completion, per channel: bump this channel's outflow on the named entry; err sticks.
+      for (int c = 0; c < N_CH; c++)
+        if (cmpl_valid[c]) begin
+          outflow_cnt[cmpl_rob_index[c]][c] <= outflow_cnt[cmpl_rob_index[c]][c] + CNT_W'(1);
+          if (cmpl_err[c]) ent_derr[cmpl_rob_index[c]] <= 1'b1;
+        end
       if (retire_fire)
         retire_ptr <= (retire_ptr == PTR_W'(ROB_DEPTH-1)) ? '0 : retire_ptr + 1'b1;
       occ <= occ + OCC_W'(admit_fire) - OCC_W'(retire_fire);

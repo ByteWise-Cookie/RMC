@@ -1,0 +1,31 @@
+# rmc_cif_w_accum formal run. From fv/:  make waccum [T=<task>]
+#   config  full RTL defaults (OFF_W/DW/STRB_W from the package)
+#   mode    prove / cover / bmc
+
+[tasks]
+full_prove full prove
+full_cover full cover
+full_bmc   full bmc
+
+[options]
+prove: mode prove
+prove: depth 4
+cover: mode cover
+cover: depth 30
+bmc:   mode bmc
+bmc:   depth 25
+
+[engines]
+smtbmc bitwuzla
+
+[script]
+plugin -i slang
+full: read_slang --top rmc_cif_w_accum --no-implicit-memories -D FORMAL rmc_cfg_pkg.sv rmc_cif_w_accum.sv rmc_cif_w_accum_fv.sv rmc_cif_w_accum_bind.sv
+prep -top rmc_cif_w_accum
+async2sync
+
+[files]
+../rtl/rtl_pkg_config/rmc_cfg_pkg.sv
+../rtl/cif/write_path/rmc_cif_w_accum.sv
+cif/rmc_cif_w_accum/rmc_cif_w_accum_fv.sv
+cif/rmc_cif_w_accum/rmc_cif_w_accum_bind.sv
