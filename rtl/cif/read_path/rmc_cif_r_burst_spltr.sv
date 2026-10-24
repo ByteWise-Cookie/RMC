@@ -109,6 +109,7 @@ module rmc_cif_r_burst_spltr #(
   output logic [SIZE_W-1:0]              admit_size,        // ar_size -> resp beat slicing
   output logic [CH_W-1:0]                admit_base_ch,     // channel of line 0 (resp CH walk)
   output logic [N_CH-1:0]                admit_ch_mask,     // channels with ch_pkts > 0
+  output logic [N_CH-1:0][CNT_W-1:0]     admit_npkts_ch,    // per-channel packet count (-> rrob)
 
   // packets out, one stream per channel (from the engines)
   output logic [N_CH-1:0]                pkt_valid,         // packet offered on channel c
@@ -259,6 +260,7 @@ module rmc_cif_r_burst_spltr #(
   assign admit_size      = s1_size;
   assign admit_base_ch   = commit_base_ch;
   assign admit_ch_mask   = commit_ch_mask;
+  assign admit_npkts_ch  = commit_ch_pkts_eff;
 
   // SHARED QUEUE storage
   logic [LINE_W-1:0]           q_base    [QUEUE_DEPTH];
