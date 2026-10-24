@@ -15,6 +15,7 @@ d4_prove   d4 prove
 d4_cover   d4 cover
 d4_bmc     d4 bmc
 d2_prove   d2 prove
+d2_cover   d2 cover
 full_prove full prove
 
 [options]
@@ -30,9 +31,9 @@ smtbmc bitwuzla
 
 [script]
 plugin -i slang
-d4:   read_slang --top rmc_cif_r_burst_spltr --no-implicit-memories -D FORMAL -G ROB_DEPTH=4 -G QUEUE_DEPTH=4 -G MAX_PKTS=16 -G N_SLOTS=16 -G AXI_IDW=4 rmc_cfg_pkg.sv rmc_cif_addrmap.sv rmc_cif_r_burst_spltr_ch.sv rmc_cif_r_burst_spltr.sv rmc_cif_r_burst_spltr_fv.sv rmc_cif_r_burst_spltr_bind.sv
-d2:   read_slang --top rmc_cif_r_burst_spltr --no-implicit-memories -D FORMAL -G ROB_DEPTH=2 -G QUEUE_DEPTH=2 -G MAX_PKTS=8  -G N_SLOTS=8  -G AXI_IDW=2 rmc_cfg_pkg.sv rmc_cif_addrmap.sv rmc_cif_r_burst_spltr_ch.sv rmc_cif_r_burst_spltr.sv rmc_cif_r_burst_spltr_fv.sv rmc_cif_r_burst_spltr_bind.sv
-full: read_slang --top rmc_cif_r_burst_spltr --no-implicit-memories -D FORMAL rmc_cfg_pkg.sv rmc_cif_addrmap.sv rmc_cif_r_burst_spltr_ch.sv rmc_cif_r_burst_spltr.sv rmc_cif_r_burst_spltr_fv.sv rmc_cif_r_burst_spltr_bind.sv
+d4:   read_slang --top rmc_cif_r_burst_spltr --no-implicit-memories -D FORMAL -G ROB_DEPTH=4 -G QUEUE_DEPTH=4 -G MAX_PKTS=16 -G N_SLOTS=16 -G AXI_IDW=4 rmc_cfg_pkg.sv rmc_cif_addrmap.sv rmc_cif_frptr.sv rmc_cif_r_burst_spltr_ch.sv rmc_cif_r_burst_spltr.sv rmc_cif_r_burst_spltr_fv.sv rmc_cif_r_burst_spltr_bind.sv
+d2:   read_slang --top rmc_cif_r_burst_spltr --no-implicit-memories -D FORMAL -G ROB_DEPTH=2 -G QUEUE_DEPTH=2 -G MAX_PKTS=8  -G N_SLOTS=8  -G AXI_IDW=2 rmc_cfg_pkg.sv rmc_cif_addrmap.sv rmc_cif_frptr.sv rmc_cif_r_burst_spltr_ch.sv rmc_cif_r_burst_spltr.sv rmc_cif_r_burst_spltr_fv.sv rmc_cif_r_burst_spltr_bind.sv
+full: read_slang --top rmc_cif_r_burst_spltr --no-implicit-memories -D FORMAL rmc_cfg_pkg.sv rmc_cif_addrmap.sv rmc_cif_frptr.sv rmc_cif_r_burst_spltr_ch.sv rmc_cif_r_burst_spltr.sv rmc_cif_r_burst_spltr_fv.sv rmc_cif_r_burst_spltr_bind.sv
 prep -top rmc_cif_r_burst_spltr
 # async-reset flops -> sync model (single clock, reset sampled on aclk)
 async2sync
@@ -40,6 +41,7 @@ async2sync
 [files]
 ../rtl/rtl_pkg_config/rmc_cfg_pkg.sv
 ../rtl/cif/cif_utils/rmc_cif_addrmap.sv
+../rtl/cif/cif_utils/rmc_cif_frptr.sv
 ../rtl/cif/read_path/rmc_cif_r_burst_spltr_ch.sv
 ../rtl/cif/read_path/rmc_cif_r_burst_spltr.sv
 cif/rmc_cif_r_burst_spltr/rmc_cif_r_burst_spltr_fv.sv
