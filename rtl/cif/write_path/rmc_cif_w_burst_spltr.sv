@@ -1,12 +1,12 @@
 // rmc_cif_w_burst_spltr.sv
 // WRITE burst splitter: pure sequencer AND ROB master, sole consumer of the AW request buffer.
-// It is the ONLY writer of the ROB and writes it exactly once per request - entry_valid at the
-// last packet (seg_last) - so there is no separate claim/reserve: the ROB holds rob_free high
-// while not full and offers rob_idx = alloc_ptr, which the splitter tags onto every packet and
-// which advances on that one entry write. Walks the 64 B lines in address order and emits one
-// line descriptor per line to the packet_formation_unit. Controls the accumulator (shape +
-// skip). A front-end error (error != 0) issues no packets: drain the accumulator, then write
-// the entry with npkts = 0 at drain_done.
+// It admits in two steps (mirrors the read ROB) so a completion never lands on an un-entered
+// slot: at capture it ADMITs - reserves rob_idx_in (= alloc_ptr) with {id, resp}, which tags
+// every packet of the request; at the last packet it SEALs with the per-channel counts. The
+// ROB offers rob_free (not full) and advances alloc_ptr at admit. Walks the 64 B lines in
+// address order, emits one line descriptor per line to the packet_formation_unit, and controls
+// the accumulator (shape + skip). A front-end error (error != 0) issues no packets: admit the
+// slot, drain the accumulator, then SEAL with npkts_ch = 0 at drain_done.
 //
 // Internals: on capture it latches the request and computes its in-page line span from
 // address + len + size - cap_l0 (first line), cap_llast (last line), cap_npkts (count). It then
@@ -43,14 +43,15 @@ module rmc_cif_w_burst_spltr #(
   // live address map (CSR)
   input  logic [DEC_W-1:0][MAP_SEL_W-1:0] addr_map,
 
-  // w_rob: slot offer in, single entry write-back out (the only signal to the ROB)
-  input  logic [ROB_IDX_W-1:0]   rob_idx_in,       // offered slot (= alloc_ptr), held for the req
+  // w_rob: slot offer in; ADMIT at capture (reserve + {id,resp}) and SEAL at the last packet
+  input  logic [ROB_IDX_W-1:0]   rob_idx_in,       // offered slot (= alloc_ptr)
   input  logic                   rob_free,         // slot free (ROB not full)
-  output logic                   entry_valid,      // one write at seg_last (drain_done on error)
-  output logic [AXI_IDW-1:0]     entry_id,
-  output logic [1:0]             entry_resp,
-  output logic [CNT_W-1:0]       entry_npkts,      // 0 on a front error
-  output logic [N_CH-1:0][CNT_W-1:0]  entry_npkts_ch,
+  output logic                   admit_valid,      // captured a request onto rob_idx_in (reserve)
+  output logic [AXI_IDW-1:0]     admit_id,
+  output logic [1:0]             admit_resp,       // front BRESP: 00 ok / 10 SLVERR / 11 DECERR
+  output logic                   seg_last,         // split done (last packet, or drain_done on error)
+  output logic [ROB_IDX_W-1:0]   seg_rob_idx,      // the slot it seals
+  output logic [N_CH-1:0][CNT_W-1:0]  seg_npkts_ch, // per-channel count (0 on a front error)
 
   // accumulator control (shape held for the W stream + drop; drain_done back)
   output logic                   stage_en,
@@ -71,8 +72,6 @@ module rmc_cif_w_burst_spltr #(
   logic                 run;
   logic [AXI_AW-1:0]    s_addr;
   logic [2:0]           s_size;
-  logic [AXI_IDW-1:0]   s_id;
-  logic [1:0]           s_err;
   logic                 drop_q;        // the current request is drain-only (front error)
   logic [ROB_IDX_W-1:0] s_rob;         // the ROB slot this request holds (rob_idx_in latched)
   logic [LINE_W-1:0]    line_q;        // current in-page line index
@@ -124,23 +123,20 @@ module rmc_cif_w_burst_spltr #(
   assign stage_len    = s_addr[PKT_OFF_W-1:0];
   assign stage_size   = s_size;
 
-  // per-channel counts and totals (bumped by the line being consumed this cycle)
+  // per-channel line count, bumped by the line being consumed this cycle (for the seal)
   logic [N_CH-1:0][CNT_W-1:0] cnt_final;
-  logic [CNT_W-1:0]           npkts_sum;
-  always_comb begin
-    npkts_sum = '0;
-    for (int c = 0; c < N_CH; c++) begin
+  always_comb
+    for (int c = 0; c < N_CH; c++)
       cnt_final[c] = cnt_q[c] + ((fire && w_ch == CH_W'(c)) ? CNT_W'(1) : '0);
-      npkts_sum    = npkts_sum + cnt_final[c];
-    end
-  end
 
-  // ENTRY to w_rob: good request at its last consumed line; dropped request at drain_done
-  assign entry_valid    = (fire & is_last) | drain_done;
-  assign entry_id       = s_id;
-  assign entry_resp     = drop_q ? s_err : 2'b00;
-  assign entry_npkts    = npkts_sum;                // 0 on a drop (no line ever fired)
-  assign entry_npkts_ch = cnt_final;
+  // ADMIT at capture: reserve the offered slot, carry the request's id + validator verdict
+  assign admit_valid  = capture;
+  assign admit_id     = aw_id;
+  assign admit_resp   = error;
+  // SEAL to w_rob: good request at its last consumed line; dropped request at drain_done
+  assign seg_last     = (fire & is_last) | drain_done;
+  assign seg_rob_idx  = s_rob;
+  assign seg_npkts_ch = cnt_final;                  // 0 on a drop (no line ever fired)
 
   always_ff @(posedge aclk or negedge aresetn) begin
     if (!aresetn) begin
@@ -152,8 +148,6 @@ module rmc_cif_w_burst_spltr #(
       drop_q <= (error != 2'b00);
       s_addr <= phy_adr;
       s_size <= aw_size;
-      s_id   <= aw_id;
-      s_err  <= error;
       s_rob  <= rob_idx_in;
       line_q <= cap_l0;
       n_left <= cap_npkts;

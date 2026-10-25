@@ -1,20 +1,20 @@
 // rmc_cif_wrob.sv
-// WRITE reorder buffer. No pre-admit: the burst splitter is the sole master and the ONLY writer,
-// writing each slot exactly once - entry_valid {id, resp, npkts, npkts_ch} at the last packet.
-// So there is no claim/reserve: rob_free is just "not full" and rob_idx = alloc_ptr is offered
-// and held until that one entry write advances it. Per-slot completion state is cleared at reset
-// and at retire, so a reused slot starts clean.
+// WRITE reorder buffer. The burst splitter is its only master, in two steps (mirrors the read
+// ROB so a completion never lands on an un-entered slot):
+//   ADMIT (request arrival): reserve the offered slot ROB_IDX (= alloc_ptr), write {id, resp},
+//     clear its completion state, advance alloc_ptr. The entry is now LIVE - completions for
+//     it can arrive (and count) while the splitter is still walking the request.
+//   SEAL  (last packet, or at once on a front error): write the per-channel target npkts_ch and
+//     set inflow_complt - the split is done. alloc_ptr already moved at admit.
 //
-// PER-CHANNEL completions. Each DRAM channel has its own completion (resp) FIFO, so two
-// channels can complete the SAME entry in the SAME cycle. A single outflow counter cannot take
-// two increments at once, so outflow is kept PER CHANNEL: completion on channel c bumps only
-// outflow_cnt[idx][c], and the entry retires when every channel has matched its own target
-// run_cnt[idx][c] (the per-channel packet count the splitter wrote). run_cnt doubles as the
-// per-channel run freed to the frptr at retire. A back-end error on any channel (cmpl_err[c])
-// sticks ent_derr and forces SLVERR; otherwise the response is the entry's stored front BRESP.
-// A front error (npkts_ch all 0) retires at once with its BRESP, no DRAM write.
+// PER-CHANNEL completions. Each DRAM channel has its own completion FIFO, so two channels can
+// complete the same entry the same cycle; outflow is per channel and an entry retires when
+// every channel reaches run_cnt[c] AND it has been sealed. run_cnt doubles as RESP_NPKTS_CH,
+// the per-channel run freed to the frptr at retire. A back-end error (cmpl_err[c]) sticks
+// ent_derr -> SLVERR; else the stored front BRESP. A front error seals with npkts_ch all 0,
+// so it retires at once with its BRESP and no DRAM write.
 //
-// Ring: alloc_ptr issues, retire_ptr drains, occ = fill; retire is in program order.
+// Ring: alloc_ptr advances at admit, retire_ptr at retire, occ = fill; retire is in order.
 
 import rmc_cfg_pkg::*;
 
@@ -34,18 +34,19 @@ module rmc_cif_wrob #(
   // completion in, ONE per channel (each channel's compl async FIFO). Pulse, never back-pressures.
   input  logic [N_CH-1:0]              cmpl_valid,
   input  logic [N_CH-1:0][ROB_IDX_W-1:0] cmpl_rob_index,
-  input  logic [N_CH-1:0]              cmpl_err,     // back-end error on that channel -> SLVERR
+  input  logic [N_CH-1:0]              cmpl_err,
 
-  // slot offer to the burst splitter (the only writer; no claim/reserve)
-  output logic [ROB_IDX_W-1:0]   rob_idx,           // offered slot (= alloc_ptr), held for the req
+  // slot offer + ADMIT (from the burst splitter, the only writer)
+  output logic [ROB_IDX_W-1:0]   ROB_IDX,           // offered slot (= alloc_ptr)
   output logic                   rob_free,          // a slot is free (ROB not full)
+  input  logic                   admit_valid,       // splitter captured a request onto ROB_IDX
+  input  logic [AXI_IDW-1:0]     admit_id,
+  input  logic [1:0]             admit_resp,        // front BRESP: 00 ok / 10 SLVERR / 11 DECERR
 
-  // single entry write-back from the splitter (at the last packet, or at once on a front error)
-  input  logic                   entry_valid,
-  input  logic [AXI_IDW-1:0]     entry_id,
-  input  logic [1:0]             entry_resp,        // front BRESP: 00 ok / 10 SLVERR / 11 DECERR
-  input  logic [CNT_W-1:0]       entry_npkts,       // total completion target (informational)
-  input  logic [N_CH-1:0][CNT_W-1:0]  entry_npkts_ch, // per-channel target (= retire + free counts)
+  // SEAL (at the last packet / at once on a front error): per-channel target + split done
+  input  logic                   SEG_LAST,
+  input  logic [ROB_IDX_W-1:0]   SEG_ROB_IDX,
+  input  logic [N_CH-1:0][CNT_W-1:0]  SEG_NPKTS_CH,
 
   // retire / B response
   output logic                   RESP_VALID,
@@ -69,16 +70,15 @@ module rmc_cif_wrob #(
   logic [AXI_IDW-1:0]         ent_id        [ROB_DEPTH];
   logic [1:0]                 ent_resp      [ROB_DEPTH];   // front-end BRESP (00 if ok)
   logic                       ent_derr      [ROB_DEPTH];   // back-end (completion) error -> SLVERR
-  logic                       inflow_complt [ROB_DEPTH];   // the splitter wrote the entry
-  logic [CNT_W-1:0]           n_pkts        [ROB_DEPTH];   // total target (informational)
+  logic                       inflow_complt [ROB_DEPTH];   // sealed: split done, npkts_ch valid
   logic [N_CH-1:0][CNT_W-1:0] run_cnt       [ROB_DEPTH];   // per-channel target + frptr free count
   logic [N_CH-1:0][CNT_W-1:0] outflow_cnt   [ROB_DEPTH];   // completions seen, per channel
 
-  // slot offer: the splitter is the only writer, so a free slot is simply "not full"
-  assign rob_idx  = alloc_ptr;
+  wire admit_fire = admit_valid & rob_free;         // reserve the offered slot this cycle
+  assign ROB_IDX  = alloc_ptr;
   assign rob_free = ~rob_full;
 
-  // retire: every channel's completions have reached its per-channel target
+  // retire: sealed and every channel's completions have reached its per-channel target
   logic all_ch_done;
   always_comb begin
     all_ch_done = 1'b1;
@@ -86,7 +86,6 @@ module rmc_cif_wrob #(
       if (outflow_cnt[retire_ptr][c] != run_cnt[retire_ptr][c]) all_ch_done = 1'b0;
   end
 
-  // retire / B response (comb). A back-end error forces SLVERR; else the stored front BRESP.
   assign RESP_VALID     = ~rob_empty & inflow_complt[retire_ptr] & all_ch_done;
   assign RESP_ID        = ent_id[retire_ptr];
   assign RESP_RESP      = ent_derr[retire_ptr] ? 2'b10 : ent_resp[retire_ptr];
@@ -98,41 +97,35 @@ module rmc_cif_wrob #(
       alloc_ptr  <= '0;
       retire_ptr <= '0;
       occ        <= '0;
-      for (int s = 0; s < ROB_DEPTH; s++) begin
-        inflow_complt[s] <= 1'b0;
-        outflow_cnt[s]   <= '0;
-        ent_derr[s]      <= 1'b0;
-      end
     end else begin
-      // ENTRY: the one write per slot - populate, mark complete-able, advance (reserve is
-      // implicit: alloc_ptr only moves here).
-      if (entry_valid) begin
-        ent_id[alloc_ptr]        <= entry_id;
-        ent_resp[alloc_ptr]      <= entry_resp;
-        n_pkts[alloc_ptr]        <= entry_npkts;
-        run_cnt[alloc_ptr]       <= entry_npkts_ch;
-        inflow_complt[alloc_ptr] <= 1'b1;
+      // ADMIT: reserve + enter the slot, clear its completion state, advance. The entry is
+      // live now, so completions that beat the split land on a real, cleared counter.
+      if (admit_fire) begin
+        ent_id[alloc_ptr]        <= admit_id;
+        ent_resp[alloc_ptr]      <= admit_resp;
+        ent_derr[alloc_ptr]      <= 1'b0;
+        inflow_complt[alloc_ptr] <= 1'b0;
+        outflow_cnt[alloc_ptr]   <= '0;
         alloc_ptr <= (alloc_ptr == PTR_W'(ROB_DEPTH-1)) ? '0 : alloc_ptr + 1'b1;
       end
 
+      // SEAL: the named slot's split is done; write its per-channel target.
+      if (SEG_LAST) begin
+        run_cnt[SEG_ROB_IDX]       <= SEG_NPKTS_CH;
+        inflow_complt[SEG_ROB_IDX] <= 1'b1;
+      end
+
       // completion, per channel: bump this channel's outflow on the named entry; err sticks.
-      // Two channels may hit the same entry the same cycle - they touch different counters
-      // (outflow_cnt[idx][c]), and both setting ent_derr[idx] write the same value.
       for (int c = 0; c < N_CH; c++)
         if (cmpl_valid[c]) begin
           outflow_cnt[cmpl_rob_index[c]][c] <= outflow_cnt[cmpl_rob_index[c]][c] + CNT_W'(1);
           if (cmpl_err[c]) ent_derr[cmpl_rob_index[c]] <= 1'b1;
         end
 
-      // retire: advance and clear the slot's completion state so it starts clean when reused
-      if (retire_fire) begin
-        inflow_complt[retire_ptr] <= 1'b0;
-        outflow_cnt[retire_ptr]   <= '0;
-        ent_derr[retire_ptr]      <= 1'b0;
+      if (retire_fire)
         retire_ptr <= (retire_ptr == PTR_W'(ROB_DEPTH-1)) ? '0 : retire_ptr + 1'b1;
-      end
 
-      occ <= occ + OCC_W'(entry_valid) - OCC_W'(retire_fire);
+      occ <= occ + OCC_W'(admit_fire) - OCC_W'(retire_fire);
     end
   end
 

@@ -240,11 +240,13 @@ module rmc_cif_rrob_fv #(
     wire live   = fv_live[i];
     wire sealed = fv_sealed[i];
     logic cnt_eq, cnt_le;
+    logic [CNT_W+NCH:0] run_sum;
     always_comb begin
-      cnt_eq = 1'b1; cnt_le = 1'b1;
+      cnt_eq = 1'b1; cnt_le = 1'b1; run_sum = '0;
       for (int c = 0; c < NCH; c++) begin
         if (outflow_cnt[i][c] != fv_cmpl[i][c]) cnt_eq = 1'b0;
         if (fv_cmpl[i][c]     >  fv_run[i][c])   cnt_le = 1'b0;
+        run_sum = run_sum + (CNT_W+NCH+1)'(fv_run[i][c]);
       end
     end
 
@@ -256,6 +258,7 @@ module rmc_cif_rrob_fv #(
     `ASSERT(a_npkts,  !live || (n_pkts[i] == fv_npkts[i] && fv_npkts[i] <= CNT_W'(MAX_PKTS)
                       && npkts_ch[i] == fv_run[i]));
     `ASSERT(a_bound,  !live || cnt_le);
+    `ASSERT(a_run_sum, !live || run_sum == (CNT_W+NCH+1)'(fv_npkts[i]));
     `ASSERT(a_adm,    !live || {madm_len[i], madm_size[i], madm_alo[i], madm_bch[i]} == fv_adm[i]);
     `ASSERT(a_head,   !(live && sealed) || mem_head[i] == fv_hd[i]);
   end
