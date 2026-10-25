@@ -23,9 +23,12 @@ module rmc_cif_w_burst_spltr_fv #(
   input logic [1:0]             error,
   input logic [ROB_IDX_W-1:0]   rob_idx_in,
   input logic                   rob_free,
-  input logic                   entry_valid,
-  input logic [AXI_IDW-1:0]     entry_id,
-  input logic [1:0]             entry_resp,
+  input logic                   admit_valid,
+  input logic [AXI_IDW-1:0]     admit_id,
+  input logic [1:0]             admit_resp,
+  input logic                   seg_last,
+  input logic [ROB_IDX_W-1:0]   seg_rob_idx,
+  input logic [N_CH-1:0][CNT_W-1:0]  seg_npkts_ch,
   input logic                   stage_en,
   input logic                   skip,
   input logic [PKT_OFF_W-1:0]   stage_len,
@@ -39,8 +42,6 @@ module rmc_cif_w_burst_spltr_fv #(
   input logic                   drop_q,
   input logic [AXI_AW-1:0]      s_addr,
   input logic [2:0]             s_size,
-  input logic [AXI_IDW-1:0]     s_id,
-  input logic [1:0]             s_err,
   input logic [ROB_IDX_W-1:0]   s_rob,
   input logic [CNT_W-1:0]       n_left
 );
@@ -65,17 +66,19 @@ module rmc_cif_w_burst_spltr_fv #(
   as_stage_len: assert property (@(posedge aclk) disable iff (!aresetn) stage_len == s_addr[PKT_OFF_W-1:0]);
   as_stage_sz:  assert property (@(posedge aclk) disable iff (!aresetn) stage_size == s_size);
 
-  // single ROB entry write: last consumed line (good) or drain_done (dropped)
-  as_entry:      assert property (@(posedge aclk) disable iff (!aresetn)
-    entry_valid == ((fire & is_last) | drain_done));
-  as_entry_id:   assert property (@(posedge aclk) disable iff (!aresetn) entry_id == s_id);
-  as_entry_resp: assert property (@(posedge aclk) disable iff (!aresetn)
-    entry_resp == (drop_q ? s_err : 2'b00));
+  // ADMIT at capture: reserve the offered slot with the request's id + verdict
+  as_admit:     assert property (@(posedge aclk) disable iff (!aresetn) admit_valid == capture);
+  as_admit_id:  assert property (@(posedge aclk) disable iff (!aresetn) admit_id   == aw_id);
+  as_admit_rsp: assert property (@(posedge aclk) disable iff (!aresetn) admit_resp == error);
+  // SEAL: last consumed line (good) or drain_done (dropped)
+  as_seg:       assert property (@(posedge aclk) disable iff (!aresetn)
+    seg_last == ((fire & is_last) | drain_done));
+  as_seg_rob:   assert property (@(posedge aclk) disable iff (!aresetn) seg_rob_idx == s_rob);
 
   // capture latches the request and starts the run
   as_capture_run: assert property (@(posedge aclk) disable iff (!aresetn)
-    !(en & $past(en) & $past(capture)) || (run & (drop_q == $past(error != 2'b00)) & (s_id == $past(aw_id))
-      & (s_rob == $past(rob_idx_in)) & (s_err == $past(error))));
+    !(en & $past(en) & $past(capture)) || (run & (drop_q == $past(error != 2'b00))
+      & (s_rob == $past(rob_idx_in))));
 
   // ------------------------------------------------------------------------
   // reference walk: a captured request must produce exactly its lines, in address order,
@@ -138,7 +141,7 @@ module rmc_cif_w_burst_spltr_fv #(
   always_ff @(posedge aclk or negedge aresetn) begin
     if (!aresetn) r_on <= 1'b0;
     else begin
-      if (entry_valid) r_on <= 1'b0;
+      if (seg_last) r_on <= 1'b0;
       if (lfire) begin
         r_k <= r_k + 1'b1;
         r_cnt[f_ch] <= r_cnt[f_ch] + 1'b1;
@@ -165,15 +168,20 @@ module rmc_cif_w_burst_spltr_fv #(
       && f_ch == k_dec[OFW +: CHW]
       && rmc_cif_w_burst_spltr.ld_daddr == k_dec[OFW + CHW +: DW_D]
       && ld_rob_idx == r_rob));
-  // exactly one ROB entry per request, after its last line (or its drain), with the counts
+  // exactly one SEAL per request, after its last line (or its drain), with the counts
   as_w_entry: assert property (@(posedge aclk) disable iff (!aresetn)
-    !entry_valid || (r_on && (r_drop ? drain_done : (lfire && r_k + 1'b1 == r_n))));
+    !seg_last || (r_on && (r_drop ? drain_done : (lfire && r_k + 1'b1 == r_n))));
+  // seal carries the admitted id/resp (admit side) + the per-channel counts summing to the run
+  logic [W-1:0] seg_sum;
+  always_comb begin
+    seg_sum = '0;
+    for (int c = 0; c < NCH; c++) seg_sum = seg_sum + W'(seg_npkts_ch[c]);
+  end
   as_w_count: assert property (@(posedge aclk) disable iff (!aresetn)
-    !entry_valid || (W'(rmc_cif_w_burst_spltr.entry_npkts) == (r_drop ? '0 : r_n)
-      && entry_id == r_id && entry_resp == (r_drop ? r_err : 2'b00)));
+    !seg_last || (seg_sum == (r_drop ? '0 : r_n)));
   for (genvar c = 0; c < NCH; c++) begin : g_cnt
     as_w_chcnt: assert property (@(posedge aclk) disable iff (!aresetn)
-      !entry_valid || rmc_cif_w_burst_spltr.entry_npkts_ch[c]
+      !seg_last || seg_npkts_ch[c]
         == r_cnt[c] + ((lfire && f_ch == CHW'(c)) ? 1'b1 : 1'b0));
     as_h_cnt: assert property (@(posedge aclk) disable iff (!aresetn)
       !run || rmc_cif_w_burst_spltr.cnt_q[c] == r_cnt[c]);
@@ -183,7 +191,7 @@ module rmc_cif_w_burst_spltr_fv #(
   // helpers
   as_h_run:   assert property (@(posedge aclk) disable iff (!aresetn)
     run == r_on && (!run || (drop_q == r_drop && s_addr == r_addr && s_rob == r_rob
-      && s_id == r_id && s_err == r_err && r_n >= 1 && r_n <= W'(MAX_PKTS)
+      && r_n >= 1 && r_n <= W'(MAX_PKTS)
       && 32'(r_addr[PG-1:OFW]) + 32'(r_n) <= (1 << (PG - OFW))
       && (r_drop || (r_k < r_n && W'(n_left) == r_n - r_k
           && 32'(rmc_cif_w_burst_spltr.line_q) == 32'(r_addr[PG-1:OFW]) + 32'(r_k))))));
@@ -197,13 +205,12 @@ module rmc_cif_w_burst_spltr_fv #(
   as_h_size:  assert property (@(posedge aclk) disable iff (!aresetn)
     !run || ((1 << s_size) <= (1 << OFW)));
 
-  c_req:      cover property (@(posedge aclk) disable iff (!aresetn) entry_valid && !r_drop && r_n > 2);
-  c_drop:     cover property (@(posedge aclk) disable iff (!aresetn) entry_valid && r_drop);
+  c_req:      cover property (@(posedge aclk) disable iff (!aresetn) seg_last && !r_drop && r_n > 2);
+  c_drop:     cover property (@(posedge aclk) disable iff (!aresetn) seg_last && r_drop);
   c_two_ch:   cover property (@(posedge aclk) disable iff (!aresetn)
-                entry_valid && rmc_cif_w_burst_spltr.entry_npkts_ch[0] != '0
-                && rmc_cif_w_burst_spltr.entry_npkts_ch[NCH-1] != '0);
+                seg_last && seg_npkts_ch[0] != '0 && seg_npkts_ch[NCH-1] != '0);
   c_stall:    cover property (@(posedge aclk) disable iff (!aresetn) ld_valid && !ld_ready);
-  c_b2b:      cover property (@(posedge aclk) disable iff (!aresetn) cap && $past(entry_valid));
+  c_b2b:      cover property (@(posedge aclk) disable iff (!aresetn) cap && $past(seg_last));
 
   // the proof starts in reset (without this the first state is unconstrained)
   logic fv_started = 1'b0;
