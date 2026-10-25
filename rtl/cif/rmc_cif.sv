@@ -294,11 +294,12 @@ module rmc_cif #(
   // write ROB handoff + retire nets
   logic                   w_rob_free;
   logic [ROB_IDX_W-1:0]   w_rob_idx;
-  logic                   w_entry_valid;
-  logic [AXI_IDW-1:0]     w_entry_id;
-  logic [1:0]             w_entry_resp;
-  logic [CNT_W-1:0]       w_entry_npkts;
-  logic [N_CH-1:0][CNT_W-1:0] w_entry_npkts_ch;
+  logic                   w_admit_valid;
+  logic [AXI_IDW-1:0]     w_admit_id;
+  logic [1:0]             w_admit_resp;
+  logic                   w_seg_last;
+  logic [ROB_IDX_W-1:0]   w_seg_rob_idx;
+  logic [N_CH-1:0][CNT_W-1:0] w_seg_npkts_ch;
   logic                   w_rsp_valid, w_rsp_ready;
   logic [AXI_IDW-1:0]     w_rsp_id;
   logic [1:0]             w_rsp_resp;
@@ -338,11 +339,12 @@ module rmc_cif #(
     .addr_map             (addr_map),
     .rob_idx_in           (w_rob_idx),
     .rob_free             (w_rob_free),
-    .entry_valid          (w_entry_valid),
-    .entry_id             (w_entry_id),
-    .entry_resp           (w_entry_resp),
-    .entry_npkts          (w_entry_npkts),
-    .entry_npkts_ch       (w_entry_npkts_ch),
+    .admit_valid          (w_admit_valid),
+    .admit_id             (w_admit_id),
+    .admit_resp           (w_admit_resp),
+    .seg_last             (w_seg_last),
+    .seg_rob_idx          (w_seg_rob_idx),
+    .seg_npkts_ch         (w_seg_npkts_ch),
     .stage_en             (w_stage_en),
     .skip                 (w_skip),
     .stage_len            (w_stage_len),
@@ -414,13 +416,14 @@ module rmc_cif #(
     .cmpl_valid     (async_mc_wr_cmpl_valid),
     .cmpl_rob_index (async_mc_wr_cmpl_rob_index),
     .cmpl_err       (async_mc_wr_cmpl_err),
-    .rob_idx        (w_rob_idx),
+    .ROB_IDX        (w_rob_idx),
     .rob_free       (w_rob_free),
-    .entry_valid    (w_entry_valid),
-    .entry_id       (w_entry_id),
-    .entry_resp     (w_entry_resp),
-    .entry_npkts    (w_entry_npkts),
-    .entry_npkts_ch (w_entry_npkts_ch),
+    .admit_valid    (w_admit_valid),
+    .admit_id       (w_admit_id),
+    .admit_resp     (w_admit_resp),
+    .SEG_LAST       (w_seg_last),
+    .SEG_ROB_IDX    (w_seg_rob_idx),
+    .SEG_NPKTS_CH   (w_seg_npkts_ch),
     .RESP_VALID     (w_rsp_valid),
     .RESP_READY     (w_rsp_ready),
     .RESP_ID        (w_rsp_id),
