@@ -129,8 +129,11 @@ module rmc_cif #(
   // READ PATH
   // ========================================================================
   localparam int R_DATA_BYTES = AXI_DW / 8;
-  localparam int R_MAX_BEATS  = MAX_REQ_BYTES / R_DATA_BYTES;
-  localparam int R_LEN_W      = (R_MAX_BEATS  > 1) ? $clog2(R_MAX_BEATS)  : 1;
+  localparam int R_MAX_BEATS  = MAX_REQ_BYTES / R_DATA_BYTES;  // full-size beats in a 4 KB burst
+  // Length keeps the full AXI ARLEN width. A narrow burst (ar_size < full) legally has more beats
+  // than R_MAX_BEATS inside the same 4 KB, so sizing the length off R_MAX_BEATS (= 6 bits) dropped
+  // ARLEN[7:6] and under-ran the burst - premature RLAST, github issue #5.
+  localparam int R_LEN_W      = AXI_LEN_W;
   localparam int R_SIZE_MAX   = (R_DATA_BYTES > 1) ? $clog2(R_DATA_BYTES) : 0;
   localparam int R_SIZE_W     = (R_SIZE_MAX   > 0) ? $clog2(R_SIZE_MAX+1) : 1;
   localparam int R_NCH_LOG_W  = $clog2(CH_W + 1);
@@ -177,7 +180,7 @@ module rmc_cif #(
     .ar_ready       (arready),
     .ar_id          (arid),
     .ar_addr        (araddr),
-    .ar_len         (R_LEN_W'(arlen)),
+    .ar_len         (arlen),
     .ar_size        (R_SIZE_W'(arsize)),
     .ar_validated   (ar_ok),
     .rob_free       (ar_rrob_rdy),
