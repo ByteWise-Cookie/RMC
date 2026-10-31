@@ -10,10 +10,8 @@
 //
 // Ranks are independent (own banks, own pair), so this is a plain genvar loop over N_RANKS.
 //
-// The per-bank cells (rmc_bank) are instanced here too: the issued packet admits into its target
-// bank and the bank's row-independent room drives the TCAM's can_drain. TODO (not here yet): the
-// per-bank timing scoreboard (can_act/can_cas/can_pre), the command arb + grants, the DFI command
-// fabric on the issue side, and upstream the rank demux + async req/compl FIFO boundary.
+// TODO (not here yet): rank demux feeding the per-rank intake, the async req/compl FIFO boundary,
+// the bank timing FSMs that drive bank_ready_vector, and the DFI command fabric on the issue side.
 
 import rmc_cfg_pkg::*;
 
@@ -27,7 +25,9 @@ module rmc_mc_top #(
   localparam int ADDR_W = DADDR_W,
   localparam int META_W = ROB_IDX_W + SLOT_W,
   localparam int PKT_W  = META_W + ADDR_W,
-  localparam int PTR_W  = (DEPTH > 1) ? $clog2(DEPTH) : 1
+  localparam int PTR_W  = (DEPTH > 1) ? $clog2(DEPTH) : 1,
+  localparam int GC_W   = 20,                // global cycle counter width (spec block #20)
+  localparam int TIMER_W = 11                // CSR timing-value width
 )(
   input  logic                 mclk,
   input  logic                 mreset,
@@ -53,6 +53,13 @@ module rmc_mc_top #(
   // issues into a bank via bank_valid; the bank's admit_ready is its can_drain back to the TCAM.
   logic [N_RANKS-1:0][N_BANK-1:0] bank_valid;
   logic [N_RANKS-1:0][N_BANK-1:0] bank_ready_vector;
+
+  // free-running global cycle counter (spec block #20): the shared time base every per-bank
+  // scoreboard compares its absolute deadlines against. Read-only to the banks.
+  logic [GC_W-1:0] gc;
+  always_ff @(posedge mclk or negedge mreset)
+    if (!mreset) gc <= '0;
+    else         gc <= gc + GC_W'(1);
 
   genvar g;
   generate
@@ -126,17 +133,43 @@ module rmc_mc_top #(
       // per-bank cells: the issued packet admits into its target bank; the bank's admit_ready is
       // its can_drain back to the TCAM. Packet = {rob_idx, slot, daddr}; daddr = {.., row, col}.
       for (genvar b = 0; b < N_BANK; b++) begin : g_bank
+        // per-bank command grants. TODO: driven by the command arb; tied off until it exists, so
+        // the FSM and the scoreboard see the same (idle) events and stay consistent.
+        logic grant_act, grant_cas, grant_pre, grant_ref;
+        assign grant_act = 1'b0;
+        assign grant_cas = 1'b0;
+        assign grant_pre = 1'b0;
+        assign grant_ref = 1'b0;
+
+        // per-bank timing scoreboard: absolute deadlines vs gc -> can_act/can_cas/can_pre
+        logic sb_can_act, sb_can_cas, sb_can_pre;
+        rmc_mc_bank_sb #( .GC_W(GC_W), .TIMER_W(TIMER_W) ) u_sb (
+          .mclk(mclk), .mreset(mreset),
+          .gc(gc),
+          // TODO: timing values from the CSR shadow; zero until wired (deadlines = gc, always legal)
+          .t_rcd('0), .t_rp('0), .t_ras('0), .t_rtp('0), .t_wr('0),
+          .grant_act(grant_act), .grant_cas(grant_cas), .grant_pre(grant_pre),
+          .cas_is_write(~out_is_read[g]),
+          .can_act(sb_can_act), .can_cas(sb_can_cas), .can_pre(sb_can_pre)
+        );
+
         rmc_bank #( .SPTR_W(SLOT_W) ) u_bank (
-          .clk        (mclk),
-          .rst_n      (mreset),
+          .clk          (mclk),
+          .rst_n        (mreset),
           .admit_valid  (bank_valid[g][b]),
           .admit_rdy_any(bank_ready_vector[g][b]),           // row-independent: no issue<->ready loop
-          .admit_row  (out_packet[g][ROW_W+COL_W-1 : COL_W]),
-          .admit_col  (out_packet[g][COL_W-1 : 0]),
-          .admit_op   (~out_is_read[g]),                       // rmc_bank: 0 = read, 1 = write
-          .admit_sptr (out_packet[g][ADDR_W +: SLOT_W])        // WD/RD-SRAM slot
-          // TODO: timing scoreboard (can_act/can_cas/can_pre), refresh (ref_*), arb grants
-          // (grant_*) and the issued ACT/CAS/PRE payload (out_*) -> DFI command fabric.
+          .admit_row    (out_packet[g][ROW_W+COL_W-1 : COL_W]),
+          .admit_col    (out_packet[g][COL_W-1 : 0]),
+          .admit_op     (~out_is_read[g]),                     // rmc_bank: 0 = read, 1 = write
+          .admit_sptr   (out_packet[g][ADDR_W +: SLOT_W]),     // WD/RD-SRAM slot
+          .can_act      (sb_can_act),
+          .can_cas      (sb_can_cas),
+          .can_pre      (sb_can_pre),
+          .grant_act    (grant_act),
+          .grant_cas    (grant_cas),
+          .grant_pre    (grant_pre),
+          .grant_ref    (grant_ref)
+          // TODO: refresh (ref_*) and the issued ACT/CAS/PRE payload (out_*) -> DFI command fabric.
         );
       end
     end
