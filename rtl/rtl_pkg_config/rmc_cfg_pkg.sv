@@ -82,6 +82,7 @@ package rmc_cfg_pkg;
   // earlier matched-per-cycle width was N_CH*DDR_CHANNEL_W).
   parameter int DDR_CHANNEL_W = 2 * DQ_W;                // per-channel data width (2 subch)
   parameter int AXI_DW        = PKT_BYTES * 8;           // system AXI data width = one 64 B line
+  parameter int AXI_LEN_W     = 8;                       // AXI4 ARLEN/AWLEN width (beats-1), fixed
 
   // ---- packet interleave / packets-per-bank (STAGE 24) ----
   // A request fans into packets; P_MAX = packets mapped to one bank (row-hit train).

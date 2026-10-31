@@ -75,8 +75,8 @@ module rmc_cif_r_burst_spltr #(
   localparam int QPTR_W     = QIDX_W + 1,                               // queue ptr = index + wrap
   localparam int DATA_BYTES = AXI_DW / 8,                               // AXI beat bytes
   localparam int SIZE_MAX   = (DATA_BYTES > 1) ? $clog2(DATA_BYTES) : 0, // max ar_size
-  localparam int MAX_BEATS  = MAX_REQ_BYTES / DATA_BYTES,               // max beats per request
-  localparam int LEN_W      = (MAX_BEATS  > 1) ? $clog2(MAX_BEATS)  : 1, // ar_len width
+  localparam int LEN_W      = AXI_LEN_W,                                // AXI ARLEN width (beats-1);
+                                                                        // a narrow burst exceeds the full-size beat count
   localparam int SIZE_W     = (SIZE_MAX   > 0) ? $clog2(SIZE_MAX+1) : 1, // ar_size width
   localparam int NCH_LOG_W  = $clog2(CH_W + 1),                         // cfg_n_ch_log2 width
   localparam int LN_W       = (PG_LINES > 1) ? $clog2(PG_LINES) : 1     // line-in-page index (6)
