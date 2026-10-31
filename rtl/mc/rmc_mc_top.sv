@@ -135,11 +135,11 @@ module rmc_mc_top #(
       for (genvar b = 0; b < N_BANK; b++) begin : g_bank
         // per-bank command grants. TODO: driven by the command arb; tied off until it exists, so
         // the FSM and the scoreboard see the same (idle) events and stay consistent.
-        logic grant_act, grant_cas, grant_pre, grant_ref;
-        assign grant_act = 1'b0;
-        assign grant_cas = 1'b0;
-        assign grant_pre = 1'b0;
-        assign grant_ref = 1'b0;
+        logic grant_act, grant_cas, grant_pre, grant_maint;
+        assign grant_act   = 1'b0;
+        assign grant_cas   = 1'b0;
+        assign grant_pre   = 1'b0;
+        assign grant_maint = 1'b0;
 
         // per-bank timing scoreboard: absolute deadlines vs gc -> can_act/can_cas/can_pre
         logic sb_can_act, sb_can_cas, sb_can_pre;
@@ -168,8 +168,9 @@ module rmc_mc_top #(
           .grant_act    (grant_act),
           .grant_cas    (grant_cas),
           .grant_pre    (grant_pre),
-          .grant_ref    (grant_ref)
-          // TODO: refresh (ref_*) and the issued ACT/CAS/PRE payload (out_*) -> DFI command fabric.
+          .grant_maint  (grant_maint)
+          // TODO: maintenance (maint_pending/maint_done) and the issued ACT/CAS/PRE payload
+          // (out_*) -> DFI command fabric.
         );
       end
     end

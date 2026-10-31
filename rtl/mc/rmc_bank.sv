@@ -12,22 +12,27 @@
 // PRE+ACT opens the row, then CAS the whole group. cas_fifo holds hits to the row
 // already open. Depths = BANK_Q_DEPTH = P_MAX (the row-hit train).
 //
+// Fairness cap: cas_weight counts CAS to the open row (reset on PRE). Once it hits
+// MAX_WEIGHT and another row (or a refresh) is waiting, the row-hit drain stops and
+// the page is closed, so a long row-hit train cannot starve a queued miss.
+//
 // FSM: IDLE -ACT-> ACTING -(can_cas=tRCD)-> OPEN -(CAS drain)-> PRE -> PREING
-//      -(can_act=tRP)-> IDLE ; REFING for refresh. Scoreboard can_* gate issue and
+//      -(can_act=tRP)-> IDLE ; MAINTING for refresh/RFM. Scoreboard can_* gate issue and
 // clock the transient states; the arb grants the actual command.
 //
-// First cut. Open: program-order between the two fifos, same-row-streak fairness cap,
-// packets admitted during ACTING re-grouping (benign re-open). Flagged below.
+// First cut. Open: program-order between the two fifos, packets admitted during
+// ACTING re-grouping (benign re-open). Flagged below.
 
 import rmc_cfg_pkg::*;
 
 module rmc_bank #(
-  parameter int Q_DEPTH = BANK_Q_DEPTH,   // cas_fifo / row_miss_fifo depth (= P_MAX)
-  parameter int SPTR_W  = 10              // payload pointer (mem_ptr / sram slot)
+  parameter int Q_DEPTH    = BANK_Q_DEPTH, // cas_fifo / row_miss_fifo depth (= P_MAX)
+  parameter int SPTR_W     = 10,           // payload pointer (mem_ptr / sram slot)
+  parameter int MAX_WEIGHT = 8             // row-hit streak cap: close the page after this many hits
 )(
   input  logic              clk,
   input  logic              rst_n,
-
+  //FIX: input from the tcam is {idx, phy_adr{row, col}, memeory_ptr, w/r_bit}
   // admit one packet into this bank (from the decoder, after the lookahead)
   input  logic              admit_valid,
   output logic              admit_ready,
@@ -42,9 +47,9 @@ module rmc_bank #(
   input  logic              can_cas,
   input  logic              can_pre,
 
-  // maintenance engine
-  input  logic              ref_pending,
-  input  logic              ref_done,
+  // maintenance (covers both refresh and RFM/rowhammer): close the page, recover, resume
+  input  logic              maint_pending,
+  input  logic              maint_done,
 
   // command readiness to the arb tree
   output logic              act_rdy,
@@ -55,7 +60,7 @@ module rmc_bank #(
   input  logic              grant_act,
   input  logic              grant_cas,
   input  logic              grant_pre,
-  input  logic              grant_ref,
+  input  logic              grant_maint,
 
   // issued-command payload (packer picks by command)
   output logic [ROW_W-1:0]  out_row,        // ACT
@@ -65,7 +70,7 @@ module rmc_bank #(
 );
 
   // FSM state
-  typedef enum logic [2:0] { IDLE, ACTING, OPEN, PREING, REFING } bank_state_e;
+  typedef enum logic [2:0] { IDLE, ACTING, OPEN, PREING, MAINTING } bank_state_e;
   bank_state_e state;
 
   logic [ROW_W-1:0] open_row;      // currently open DRAM row (valid in OPEN)
@@ -105,17 +110,26 @@ module rmc_bank #(
   assign cas_wr = adm_fire & hit;
   assign rm_wr  = adm_miss;
 
+  // row-hit streak cap: count CAS to the open row, reset on PRE. Once the cap is hit AND another
+  // row (or a refresh) is waiting, stop serving row-hits and close the page so the waiting row gets
+  // served - keeps a long row-hit train from starving a queued miss.
+  localparam int CW = (MAX_WEIGHT > 1) ? $clog2(MAX_WEIGHT+1) : 1;
+  logic [CW-1:0] cas_weight;
+  wire weight_cap = (cas_weight == CW'(MAX_WEIGHT));
+  wire cap_stall  = weight_cap & (~rm_empty | maint_pending); // cap reached and something else waits
+
   // CAS source: the just-opened group (row_miss head whose toggle matches), then the queued hits
   logic miss_grp_valid, cas_src_miss, cas_src_hit;
   assign miss_grp_valid = (state == OPEN) & ~rm_empty & (rm_tgl == cur_toggle);
   assign cas_src_miss   = miss_grp_valid;
-  assign cas_src_hit    = (state == OPEN) & ~cas_empty & ~miss_grp_valid;
+  assign cas_src_hit    = (state == OPEN) & ~cas_empty & ~miss_grp_valid & ~cap_stall;
 
   // command readiness to the arb
   logic need_switch;
-  // current row done (group drained + no queued hits) and another row waits (or ref)
-  assign need_switch = (state == OPEN) & cas_empty & ~miss_grp_valid &
-                       (~rm_empty | ref_pending);
+  // current group done, and either the hits ran out or the streak cap tripped, and another row
+  // (or a refresh) is waiting -> close the page
+  assign need_switch = (state == OPEN) & ~miss_grp_valid &
+                       (~rm_empty | maint_pending) & (cas_empty | weight_cap);
   assign act_rdy = (state == IDLE) & ~rm_empty & can_act;
   assign cas_rdy = (state == OPEN) & can_cas & (cas_src_miss | cas_src_hit);
   assign pre_rdy = need_switch & can_pre;
@@ -158,6 +172,13 @@ module rmc_bank #(
     end
   end
 
+  // row-hit streak counter: ++ per granted row-hit CAS (saturating), reset when the page closes
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n)                              cas_weight <= '0;
+    else if (grant_pre)                      cas_weight <= '0;             // page closed
+    else if (grant_cas & cas_src_hit & ~weight_cap) cas_weight <= cas_weight + CW'(1);
+  end
+
   // FSM transitions
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -167,7 +188,7 @@ module rmc_bank #(
     end else begin
       unique case (state)
         IDLE: begin
-          if (ref_pending & grant_ref) state <= REFING;
+          if (maint_pending & grant_maint) state <= MAINTING;
           else if (grant_act) begin
             state      <= ACTING;
             open_row   <= rm_row;       // open the head group's row
@@ -177,7 +198,7 @@ module rmc_bank #(
         ACTING:  if (can_cas)  state <= OPEN;    // tRCD elapsed
         OPEN:    if (grant_pre) state <= PREING; // row miss / switch
         PREING:  if (can_act)  state <= IDLE;    // tRP elapsed
-        REFING:  if (ref_done) state <= IDLE;    // tRFC elapsed
+        MAINTING: if (maint_done) state <= IDLE;  // tRFC / RFM recovery elapsed
         default:               state <= IDLE;
       endcase
     end
