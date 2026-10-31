@@ -10,8 +10,10 @@
 //
 // Ranks are independent (own banks, own pair), so this is a plain genvar loop over N_RANKS.
 //
-// TODO (not here yet): rank demux feeding the per-rank intake, the async req/compl FIFO boundary,
-// the bank timing FSMs that drive bank_ready_vector, and the DFI command fabric on the issue side.
+// The per-bank cells (rmc_bank) are instanced here too: the issued packet admits into its target
+// bank and the bank's row-independent room drives the TCAM's can_drain. TODO (not here yet): the
+// per-bank timing scoreboard (can_act/can_cas/can_pre), the command arb + grants, the DFI command
+// fabric on the issue side, and upstream the rank demux + async req/compl FIFO boundary.
 
 import rmc_cfg_pkg::*;
 
@@ -40,15 +42,17 @@ module rmc_mc_top #(
   input  logic [N_RANKS-1:0][PKT_W-1:0]   wr_pkt,
   output logic [N_RANKS-1:0]              wr_tcam_ready,
 
-  // per-rank, per-bank readiness (from the bank FSMs)
-  input  logic [N_RANKS-1:0][N_BANK-1:0]  bank_ready_vector,
-
   // per-rank muxed issue (active direction)
   output logic [N_RANKS-1:0]              out_valid,
   output logic [N_RANKS-1:0]              out_is_read,
   output logic [N_RANKS-1:0][PKT_W-1:0]   out_packet,
   output logic [N_RANKS-1:0][N_BANK-1:0]  out_bank_vector
 );
+
+  // bank admit (one-hot per issued packet) and bank readiness, both per {rank,bank}. The TCAM
+  // issues into a bank via bank_valid; the bank's admit_ready is its can_drain back to the TCAM.
+  logic [N_RANKS-1:0][N_BANK-1:0] bank_valid;
+  logic [N_RANKS-1:0][N_BANK-1:0] bank_ready_vector;
 
   genvar g;
   generate
@@ -115,6 +119,26 @@ module rmc_mc_top #(
       assign out_is_read[g]     = r_valid;
       assign out_packet[g]      = r_valid ? r_packet : w_packet;
       assign out_bank_vector[g] = r_valid ? r_bank   : w_bank;
+
+      // the issue one-hot is the per-bank admit valid for this rank
+      assign bank_valid[g] = out_bank_vector[g];
+
+      // per-bank cells: the issued packet admits into its target bank; the bank's admit_ready is
+      // its can_drain back to the TCAM. Packet = {rob_idx, slot, daddr}; daddr = {.., row, col}.
+      for (genvar b = 0; b < N_BANK; b++) begin : g_bank
+        rmc_bank #( .SPTR_W(SLOT_W) ) u_bank (
+          .clk        (mclk),
+          .rst_n      (mreset),
+          .admit_valid  (bank_valid[g][b]),
+          .admit_rdy_any(bank_ready_vector[g][b]),           // row-independent: no issue<->ready loop
+          .admit_row  (out_packet[g][ROW_W+COL_W-1 : COL_W]),
+          .admit_col  (out_packet[g][COL_W-1 : 0]),
+          .admit_op   (~out_is_read[g]),                       // rmc_bank: 0 = read, 1 = write
+          .admit_sptr (out_packet[g][ADDR_W +: SLOT_W])        // WD/RD-SRAM slot
+          // TODO: timing scoreboard (can_act/can_cas/can_pre), refresh (ref_*), arb grants
+          // (grant_*) and the issued ACT/CAS/PRE payload (out_*) -> DFI command fabric.
+        );
+      end
     end
   endgenerate
 

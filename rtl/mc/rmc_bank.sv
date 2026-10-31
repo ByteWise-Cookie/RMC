@@ -31,6 +31,7 @@ module rmc_bank #(
   // admit one packet into this bank (from the decoder, after the lookahead)
   input  logic              admit_valid,
   output logic              admit_ready,
+  output logic              admit_rdy_any,  // room for one more regardless of hit/miss (scheduler can_drain)
   input  logic [ROW_W-1:0]  admit_row,
   input  logic [COL_W-1:0]  admit_col,
   input  logic              admit_op,       // 0 = read, 1 = write
@@ -63,7 +64,7 @@ module rmc_bank #(
   output logic [SPTR_W-1:0] out_sptr        // CAS
 );
 
-  // ---- FSM ----
+  // FSM state
   typedef enum logic [2:0] { IDLE, ACTING, OPEN, PREING, REFING } bank_state_e;
   bank_state_e state;
 
@@ -72,7 +73,7 @@ module rmc_bank #(
   logic [ROW_W-1:0] last_miss_row; // CMP2 target (admit-side grouping)
   logic             toggle;        // current admit-side group toggle
 
-  // ---- cas_fifo: hits to open_row.  entry = {col, op, sptr} ----
+  // cas_fifo: hits to the open row. entry = {col, op, sptr}
   localparam int CAS_W = COL_W + 1 + SPTR_W;
   logic             cas_empty, cas_full;
   logic [CAS_W-1:0] cas_head;
@@ -80,7 +81,7 @@ module rmc_bank #(
   logic [COL_W-1:0]  cas_col;  logic cas_op;  logic [SPTR_W-1:0] cas_sptr;
   assign {cas_col, cas_op, cas_sptr} = cas_head;
 
-  // ---- row_miss_fifo: misses, grouped by toggle.  entry = {row,col,op,sptr,tgl} ----
+  // row_miss_fifo: misses, grouped by toggle. entry = {row, col, op, sptr, tgl}
   localparam int MISS_W = ROW_W + COL_W + 1 + SPTR_W + 1;
   logic              rm_empty, rm_full;
   logic [MISS_W-1:0] rm_head;
@@ -89,10 +90,13 @@ module rmc_bank #(
   logic [SPTR_W-1:0] rm_sptr; logic rm_tgl;
   assign {rm_row, rm_col, rm_op, rm_sptr, rm_tgl} = rm_head;
 
-  // ---- admit classify (CMP1) ----
+  // admit classify: CMP1 = hit to the currently open row
   logic hit, adm_fire, adm_miss, new_row, push_tgl;
   assign hit      = (state == OPEN) & (admit_row == open_row);           // CMP1
   assign admit_ready = hit ? ~cas_full : ~rm_full;
+  // row-independent readiness for the scheduler: room whether the next packet hits or misses. Not
+  // a function of admit_row, so it does not form a loop with the issue pick that drives admit_row.
+  assign admit_rdy_any = ~cas_full & ~rm_full;
   assign adm_fire = admit_valid & admit_ready;
   assign adm_miss = adm_fire & ~hit;
   assign new_row  = adm_miss & (admit_row != last_miss_row);             // CMP2
@@ -101,13 +105,13 @@ module rmc_bank #(
   assign cas_wr = adm_fire & hit;
   assign rm_wr  = adm_miss;
 
-  // ---- CAS source: the opened group (row_miss head, matching toggle) then hits ----
+  // CAS source: the just-opened group (row_miss head whose toggle matches), then the queued hits
   logic miss_grp_valid, cas_src_miss, cas_src_hit;
   assign miss_grp_valid = (state == OPEN) & ~rm_empty & (rm_tgl == cur_toggle);
   assign cas_src_miss   = miss_grp_valid;
   assign cas_src_hit    = (state == OPEN) & ~cas_empty & ~miss_grp_valid;
 
-  // ---- readiness ----
+  // command readiness to the arb
   logic need_switch;
   // current row done (group drained + no queued hits) and another row waits (or ref)
   assign need_switch = (state == OPEN) & cas_empty & ~miss_grp_valid &
@@ -116,17 +120,17 @@ module rmc_bank #(
   assign cas_rdy = (state == OPEN) & can_cas & (cas_src_miss | cas_src_hit);
   assign pre_rdy = need_switch & can_pre;
 
-  // ---- fifo pops ----
+  // pop a fifo on the matching CAS grant
   assign cas_rd = grant_cas & cas_src_hit;
   assign rm_rd  = grant_cas & cas_src_miss;
 
-  // ---- issued payload ----
+  // issued-command payload
   assign out_row  = rm_row;                                   // ACT opens group's row
   assign out_col  = cas_src_miss ? rm_col  : cas_col;
   assign out_op   = cas_src_miss ? rm_op   : cas_op;
   assign out_sptr = cas_src_miss ? rm_sptr : cas_sptr;
 
-  // ---- fifos ----
+  // the two queues
   rmc_fifo #(.WIDTH(CAS_W), .DEPTH(Q_DEPTH), .FWFT(1'b1)) u_cas_fifo (
     .clk(clk), .rst_n(rst_n),
     .wr_en(cas_wr), .wr_data({admit_col, admit_op, admit_sptr}),
@@ -143,7 +147,7 @@ module rmc_bank #(
     .almost_full(), .almost_empty(), .count(), .overflow(), .underflow()
   );
 
-  // ---- admit-side grouping state ----
+  // admit-side grouping state (tracks the row/toggle of the last miss)
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       toggle        <= 1'b0;
@@ -154,7 +158,7 @@ module rmc_bank #(
     end
   end
 
-  // ---- FSM ----
+  // FSM transitions
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       state      <= IDLE;
